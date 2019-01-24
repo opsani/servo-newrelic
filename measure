@@ -163,6 +163,7 @@ class NewRelicDriver(Measure):
 
         self.progress_message = 'Measuring'
         time.sleep(duration)
+        self.stop_timer()
         metrics = {}
         start = datetime.now(timezone.utc)
         for name, metric in config['metrics'].items():
