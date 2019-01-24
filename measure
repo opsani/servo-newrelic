@@ -104,7 +104,7 @@ class APM:
             })
             values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
             try:
-                instance_timeseries.append({"id": inst_id,
+                instance_timeseries.append({"id": str(inst_id),
                                             "data": [[i, v] for i, v in enumerate(values_timeseries[value_name])]})
             except KeyError:
                 raise KeyError('Value "{}" of metric "{}" could not be found.'.format(value_name, metric_name))
@@ -137,6 +137,7 @@ class NewRelicDriver(Measure):
             print(json.dumps({'progress': 0, 'message': msg}), flush=True)
             time.sleep(warmup)
 
+        time.sleep(duration)
         metrics = {}
         start = datetime.now(timezone.utc)
         for name, metric in config['metrics'].items():
