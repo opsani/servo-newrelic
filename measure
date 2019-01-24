@@ -30,7 +30,7 @@ session = requests.Session()
 session.headers.update({'X-Api-Key': NEWRELIC_API_KEY})
 
 
-def newrelic_request(path, params, retries=3, method='get', **kwargs):
+def newrelic_request(path, params, retries=5, method='get', **kwargs):
     retry = retries
     last_error = None
     while retry:
@@ -95,13 +95,13 @@ class APM:
     def get_metric_timeseries(self, metric_name, value_name, from_time, duration=3600):
         instance_ids = self.get_instance_ids_by_query(self.hostname_query)
         instance_timeseries = []
-        start = from_time.replace(second=0, microsecond=0)
-        end = (start - timedelta(seconds=duration)).replace(second=0, microsecond=0)
+        start = from_time - timedelta(seconds=duration)
+        end = from_time
         for inst_id in instance_ids:
             data = newrelic_request(INSTANCE_METRICS_URL.format(app_id=self.app_id, instance_id=inst_id), params={
                 'names[]': tuple(map(lambda m: m['nr_metric'], config['metrics'].values())),
-                'from': end.isoformat(),
-                'to': start.isoformat(),
+                'from': start.isoformat(),
+                'to': end.isoformat(),
             })
             values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
             try:
@@ -137,7 +137,7 @@ class NewRelicDriver(Measure):
         self.timer.start()
 
     def update_progress(self):
-        self.progress = int((1 - self.time_left / self.time_to_wait) * 100)
+        self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
         self.start_timer()
 
     def measure(self):
@@ -164,9 +164,11 @@ class NewRelicDriver(Measure):
         self.progress_message = 'Measuring'
         time.sleep(duration)
         self.stop_timer()
+
         metrics = {}
         start = datetime.now(timezone.utc)
-        for name, metric in config['metrics'].items():
+        for i, (name, metric) in enumerate(config['metrics'].items()):
+            self.progress = 80 + int(i / len(config['metrics']) * 20)
             metrics[name] = {
                 "values": apm.get_metric_timeseries(metric_name=metric['nr_metric'], value_name=metric['nr_value'],
                                                     from_time=start, duration=duration)
