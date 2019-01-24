@@ -17,6 +17,7 @@ VERSION = '0.0.1'
 
 DFLT_WARMUP = 0
 DFLT_DURATION = 120
+DFLT_DELAY = 0
 
 NEWRELIC_API_KEY = str(open('/run/secrets/optune_newrelic_api_key').read()).strip()
 API_URL = 'https://api.newrelic.com/v2'
@@ -80,9 +81,8 @@ class APMException(Exception):
 
 
 class APM:
-    def __init__(self, app_id, instance_hostname_query):
+    def __init__(self, app_id):
         self.app_id = app_id
-        self.hostname_query = instance_hostname_query
 
     def get_instance_ids_by_query(self, query):
         data = newrelic_request(INSTANCES_URL.format(app_id=self.app_id), params={'filter[hostname]': query})
@@ -92,16 +92,13 @@ class APM:
 
     # Here we gather metrics per instance and extract particular submetric timeseries of particular metric.
     # Returns [{id, data: [timeseries]}, ...]
-    def get_metric_timeseries(self, metric_name, value_name, from_time, duration=3600):
-        instance_ids = self.get_instance_ids_by_query(self.hostname_query)
+    def get_metric_timeseries(self, instance_ids, metric_name, value_name, from_time, to_time):
         instance_timeseries = []
-        start = from_time - timedelta(seconds=duration)
-        end = from_time
         for inst_id in instance_ids:
             data = newrelic_request(INSTANCE_METRICS_URL.format(app_id=self.app_id, instance_id=inst_id), params={
                 'names[]': tuple(map(lambda m: m['nr_metric'], config['metrics'].values())),
-                'from': start.isoformat(),
-                'to': end.isoformat(),
+                'from': from_time.isoformat(),
+                'to': to_time.isoformat(),
             })
             values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
             try:
@@ -113,15 +110,6 @@ class APM:
 
 
 class NewRelicDriver(Measure):
-    def ms(self):
-        self.progress_message = 'Measurements started'
-        self.print_progress()
-
-    def me(self):
-        self.progress = 100
-        self.progress_message = 'Measurements completed'
-        self.print_progress()
-
     timer = None
     time_to_wait = 0
     time_left = 0
@@ -141,40 +129,57 @@ class NewRelicDriver(Measure):
         self.start_timer()
 
     def measure(self):
-        self.ms()
+        self.progress_message = 'Measurements started'
+        self.print_progress()
 
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
         duration = int(control.get('duration', DFLT_DURATION))
+        delay = int(control.get('delay', DFLT_DELAY))
 
         assert config['app_id'], 'You did not provide APM application id to query metrics from.'
-        apm = APM(app_id=config['app_id'], instance_hostname_query=config['instance_hostname_query'])
+        apm = APM(app_id=config['app_id'])
 
-        self.time_to_wait = warmup + duration
+        self.time_to_wait = warmup + duration + delay
         self.time_left = self.time_to_wait
         self.start_timer()
 
         # warmup nap
         if warmup > 0:
-            msg = 'WARMUP:  sleeping {} seconds'.format(warmup)
+            msg = 'WARMUP: sleeping {} seconds'.format(warmup)
             self.progress_message = msg
-            print(json.dumps({'progress': 0, 'message': msg}), flush=True)
+            self.progress = 0
             time.sleep(warmup)
 
-        self.progress_message = 'Measuring'
+        # Wait for duration period before gathering measurements
+        self.progress_message = 'DURATION: waiting {} seconds to gather measurements'.format(duration)
         time.sleep(duration)
-        self.stop_timer()
 
         metrics = {}
         start = datetime.now(timezone.utc)
-        for i, (name, metric) in enumerate(config['metrics'].items()):
-            self.progress = 80 + int(i / len(config['metrics']) * 20)
+
+        # Delay measurements
+        self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
+        time.sleep(delay)
+        self.stop_timer()
+
+        self.progress_message = 'Gathering measurements'
+        cmetrics = config['metrics']
+        for i, (name, metric) in enumerate(cmetrics.items()):
+            instance_ids = apm.get_instance_ids_by_query(metric.get('nr_hostname_query',
+                                                                    config.get('nr_hostname_query')))
+            self.progress = 80 + int(i / len(cmetrics) * 20)
             metrics[name] = {
-                "values": apm.get_metric_timeseries(metric_name=metric['nr_metric'], value_name=metric['nr_value'],
-                                                    from_time=start, duration=duration)
+                "values": apm.get_metric_timeseries(instance_ids=instance_ids,
+                                                    metric_name=metric['nr_metric'], value_name=metric['nr_value'],
+                                                    from_time=start - timedelta(seconds=duration),
+                                                    to_time=start)
             }
 
-        self.me()
+        self.progress = 100
+        self.progress_message = 'Measurements completed'
+        self.print_progress()
+
         return metrics, {}
 
     def describe(self):
@@ -184,6 +189,7 @@ class NewRelicDriver(Measure):
         return metrics
 
     def handle_cancel(self, **kwargs):
+        print('Cancelling measurements')
         quit(0)
 
 
