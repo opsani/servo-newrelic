@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from functools import reduce
+from json import JSONDecodeError
+
+import requests
+import yaml
+
+from measure import Measure
+
+DESC = 'NewRelic measure driver for Optune'
+HAS_CANCEL = True
+VERSION = '0.0.1'
+
+NEWRELIC_API_KEY = str(open('/run/secrets/optune_newrelic_api_key').read()).strip()
+API_URL = 'https://api.newrelic.com/v2'
+INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
+INSTANCES_URL = '/applications/{app_id}/instances.json'
+
+with open('./config.yaml') as f:
+    config = yaml.load(f.read())['newrelic']
+
+session = requests.Session()
+session.headers.update({'X-Api-Key': NEWRELIC_API_KEY})
+
+
+def newrelic_request(path, params, retries=3, method='get', **kwargs):
+    retry = retries
+    last_error = None
+    while retry:
+        try:
+            res = getattr(session, method)(url=API_URL + path, params=params, **kwargs)
+            return res.json()
+        except Exception as e:
+            last_error = e
+            retry -= 1
+            continue
+        except JSONDecodeError as e:
+            raise Exception('Expected JSON as a response from "{}" but got something else. '
+                            'Error: {}'.format(path, str(e)))
+    if last_error:
+        raise last_error
+    raise Exception('We ran out of retries (total {}) for NewRelic request to '
+                    '"{} {}" with params "{}"'.format(retries, method.upper(), path, json.dumps(params)))
+
+
+class Metrics:
+    def __init__(self, metrics):
+        self.metrics = {m['name']: m for m in metrics}
+
+    def get_metric_values_timeseries(self, metric_name):
+        # Convert from:
+        # [{a: 1}, {a: 2}, {a: 3}]
+        # To:
+        # {a: [1, 2, 3]}
+        def fn(memo, timeslice):
+            ret = {**memo}
+            for name, value in timeslice['values'].items():
+                # Set empty array for the value we have not seen before.
+                ret.setdefault(name, []).append(value)
+            return ret
+        assert metric_name in self.metrics, 'Requested metric with name "{}" is not found. ' \
+                                            'Available metrics are ' \
+                                            '"{}"'.format(metric_name, '", "'.join(self.metrics.keys()))
+        # Convert from
+        # [{values: {a: 1, b: 2, ...}}, ...]
+        # To
+        # {a: [1, 2, ...], ...}
+        return reduce(fn, self.metrics[metric_name]['timeslices'], {})
+
+
+class APMException(Exception):
+    pass
+
+
+class APM:
+    def __init__(self, app_id, instance_hostname_query):
+        self.app_id = app_id
+        self.hostname_query = instance_hostname_query
+
+    def get_instance_ids_by_query(self, query):
+        data = newrelic_request(INSTANCES_URL.format(app_id=self.app_id), params={'filter[hostname]': query})
+        if 'error' in data:
+            raise APMException(data['error']['title'])
+        return [i['id'] for i in data['application_instances']]
+
+    # Here we gather metrics per instance and extract particular submetric timeseries of particular metric.
+    # Returns [{id, data: [timeseries]}, ...]
+    def get_metric_timeseries(self, metric_name, value_name, from_time, for_past_minutes=60):
+        instance_ids = self.get_instance_ids_by_query(self.hostname_query)
+        instance_timeseries = []
+        for inst_id in instance_ids:
+            start = from_time.replace(second=0, microsecond=0)
+            data = newrelic_request(INSTANCE_METRICS_URL.format(app_id=self.app_id, instance_id=inst_id), params={
+                'names[]': tuple(map(lambda m: m['nr_metric'], config['metrics'].values())),
+                'from': (start - timedelta(minutes=for_past_minutes)).isoformat(),
+                'to': start.isoformat(),
+            })
+            values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
+            try:
+                instance_timeseries.append({"id": inst_id, "data": values_timeseries[value_name]})
+            except KeyError:
+                raise KeyError('Value "{}" of metric "{}" could not be found.'.format(value_name, metric_name))
+        return instance_timeseries
+
+
+class NewRelicDriver(Measure):
+    def ms(self):
+        self.progress_message = 'Measurements started'
+        self.print_progress()
+
+    def me(self):
+        self.progress = 100
+        self.progress_message = 'Measurements completed'
+        self.print_progress()
+
+    def measure(self):
+        self.ms()
+
+        assert config['app_id'], 'You did not provide APM application id to query metrics from.'
+        apm = APM(app_id=config['app_id'], instance_hostname_query=config['instance_hostname_query'])
+
+        metrics = {}
+        start = datetime.now(timezone.utc)
+        for name, metric in config['metrics'].items():
+            metrics[name] = {
+                "values": apm.get_metric_timeseries(metric_name=metric['nr_metric'], value_name=metric['nr_value'],
+                                                    from_time=start, for_past_minutes=config['for_past_minutes'])
+            }
+
+        self.me()
+        return metrics, {}
+
+    def describe(self):
+        metrics = {}
+        for k, v in config['metrics'].items():
+            metrics[k] = dict((a, b) for a, b in v.items() if not a.startswith('nr_'))
+        return metrics
+
+    def handle_cancel(self, **kwargs):
+        quit(0)
+
+
+if __name__ == '__main__':
+    driver = NewRelicDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION, progress_interval=1)
+    driver.run()

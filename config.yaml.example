@@ -1,0 +1,16 @@
+newrelic:
+  app_id: 123
+  instance_hostname_query: service-instance-
+  metrics:
+    cpu_user:
+      nr_metric: CPU/User Time
+      nr_value: percent
+      unit: percent
+    cpu_system:
+      nr_metric: CPU/System Time
+      nr_value: percent
+      unit: percent
+    mem:
+      nr_metric: Memory/Physical
+      nr_value: total_used_mb
+      unit: megabyte
