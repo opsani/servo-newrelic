@@ -104,7 +104,8 @@ class APM:
             })
             values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
             try:
-                instance_timeseries.append({"id": inst_id, "data": values_timeseries[value_name]})
+                instance_timeseries.append({"id": inst_id,
+                                            "data": [[i, v] for i, v in enumerate(values_timeseries[value_name])]})
             except KeyError:
                 raise KeyError('Value "{}" of metric "{}" could not be found.'.format(value_name, metric_name))
         return instance_timeseries
