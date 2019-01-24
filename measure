@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json
-import os
+import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
 from json import JSONDecodeError
@@ -13,6 +13,9 @@ from measure import Measure
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
 VERSION = '0.0.1'
+
+DFLT_WARMUP = 0
+DFLT_DURATION = 120
 
 NEWRELIC_API_KEY = str(open('/run/secrets/optune_newrelic_api_key').read()).strip()
 API_URL = 'https://api.newrelic.com/v2'
@@ -88,14 +91,15 @@ class APM:
 
     # Here we gather metrics per instance and extract particular submetric timeseries of particular metric.
     # Returns [{id, data: [timeseries]}, ...]
-    def get_metric_timeseries(self, metric_name, value_name, from_time, for_past_minutes=60):
+    def get_metric_timeseries(self, metric_name, value_name, from_time, duration=3600):
         instance_ids = self.get_instance_ids_by_query(self.hostname_query)
         instance_timeseries = []
+        start = from_time.replace(second=0, microsecond=0)
+        end = (start - timedelta(seconds=duration)).replace(second=0, microsecond=0)
         for inst_id in instance_ids:
-            start = from_time.replace(second=0, microsecond=0)
             data = newrelic_request(INSTANCE_METRICS_URL.format(app_id=self.app_id, instance_id=inst_id), params={
                 'names[]': tuple(map(lambda m: m['nr_metric'], config['metrics'].values())),
-                'from': (start - timedelta(minutes=for_past_minutes)).isoformat(),
+                'from': end.isoformat(),
                 'to': start.isoformat(),
             })
             values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
@@ -119,15 +123,25 @@ class NewRelicDriver(Measure):
     def measure(self):
         self.ms()
 
+        control = self.input_data.get('control', {})
+        warmup = int(control.get('warmup', DFLT_WARMUP))
+        duration = int(control.get('duration', DFLT_DURATION))
+
         assert config['app_id'], 'You did not provide APM application id to query metrics from.'
         apm = APM(app_id=config['app_id'], instance_hostname_query=config['instance_hostname_query'])
+
+        # warmup nap
+        if warmup > 0:
+            msg = 'WARMUP:  sleeping {} seconds'.format(warmup)
+            print(json.dumps({'progress': 0, 'message': msg}), flush=True)
+            time.sleep(warmup)
 
         metrics = {}
         start = datetime.now(timezone.utc)
         for name, metric in config['metrics'].items():
             metrics[name] = {
                 "values": apm.get_metric_timeseries(metric_name=metric['nr_metric'], value_name=metric['nr_value'],
-                                                    from_time=start, for_past_minutes=config['for_past_minutes'])
+                                                    from_time=start, duration=duration)
             }
 
         self.me()
