@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
 from json import JSONDecodeError
+from threading import Timer
 
 import requests
 import yaml
@@ -121,6 +122,24 @@ class NewRelicDriver(Measure):
         self.progress_message = 'Measurements completed'
         self.print_progress()
 
+    timer = None
+    time_to_wait = 0
+    time_left = 0
+
+    def stop_timer(self):
+        if self.timer:
+            self.timer.cancel()
+
+    def start_timer(self):
+        self.stop_timer()
+        self.time_left -= 1
+        self.timer = Timer(1, self.update_progress)
+        self.timer.start()
+
+    def update_progress(self):
+        self.progress = int((1 - self.time_left / self.time_to_wait) * 90)
+        self.start_timer()
+
     def measure(self):
         self.ms()
 
@@ -131,12 +150,18 @@ class NewRelicDriver(Measure):
         assert config['app_id'], 'You did not provide APM application id to query metrics from.'
         apm = APM(app_id=config['app_id'], instance_hostname_query=config['instance_hostname_query'])
 
+        self.time_to_wait = warmup + duration
+        self.time_left = self.time_to_wait
+        self.start_timer()
+
         # warmup nap
         if warmup > 0:
             msg = 'WARMUP:  sleeping {} seconds'.format(warmup)
+            self.progress_message = msg
             print(json.dumps({'progress': 0, 'message': msg}), flush=True)
             time.sleep(warmup)
 
+        self.progress_message = 'Measuring'
         time.sleep(duration)
         metrics = {}
         start = datetime.now(timezone.utc)
