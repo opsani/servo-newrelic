@@ -14,7 +14,7 @@ from measure import Measure
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 DFLT_WARMUP = 0
 DFLT_DURATION = 120
@@ -133,13 +133,11 @@ class InsightsQuery(dict):
         if isinstance(md_contents, dict):
             if 'timeSeries' in md_contents:
                 for i, col_md in enumerate(md_contents['timeSeries']['contents']):
-                    _data = None
                     if 'facets' in data:
                         column = InsightsFacetedColumn(data['facets'], col_md, idx=i)
                     else:
-                        column = InsightsColumn(_data, col_md)
+                        column = InsightsColumn(data, col_md)
                     self.columns.append(column)
-        pass
 
     def get_column_by_name(self, column_name):
         for column in self.columns:
@@ -274,8 +272,7 @@ class NewRelicDriver(Measure):
                 response = insights_session.get('', params=dict(nrql=query))
                 data = response.json()
                 if 'error' in data:
-                    raise InsightsException(
-                        '{}\nIn Query:\n{}'.format(data['error'], query))
+                    raise InsightsException('{}\nIn Query:\n{}'.format(data['error'], query))
                 fetches[fetch_name] = InsightsQuery(data)
 
             # Handle APM Instance List API call.
@@ -331,6 +328,12 @@ class NewRelicDriver(Measure):
 
     def describe(self):
         metrics = {}
+        for metric in config['metrics']:
+            keys = {}
+            for mk, mv in metric.items():
+                if mk not in ['name', 'value', 'values']:
+                    keys[mk] = mv
+            metrics[metric['name']] = keys
         return metrics
 
     def handle_cancel(self, **kwargs):
