@@ -213,19 +213,19 @@ class APMMetric:
 
 
 class NewRelicDriver(Measure):
-    timer = None
+    progress_timer = None
     time_to_wait = 0
     time_left = 0
 
     def stop_timer(self):
-        if self.timer:
-            self.timer.cancel()
+        if self.progress_timer:
+            self.progress_timer.cancel()
 
     def start_timer(self):
         self.stop_timer()
         self.time_left -= 1
-        self.timer = Timer(1, self.update_progress)
-        self.timer.start()
+        self.progress_timer = Timer(1, self.update_progress)
+        self.progress_timer.start()
 
     def update_progress(self):
         self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
