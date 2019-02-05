@@ -256,14 +256,16 @@ class NewRelicDriver(Measure):
         time.sleep(delay)
         self.stop_timer()
 
-        self.progress_message = 'Gathering measurements'
         config_fetches = config['fetch']
+        config_fetches_len = len(config_fetches)
         config_metrics = config['metrics']
 
         fetches = {}
-        for fetch in config_fetches:
+        for i, fetch in enumerate(config_fetches):
             fetch_name = fetch['name']
             fetch_api = fetch['api']
+            self.progress = 80 + ((i / config_fetches_len) * 20)
+            self.progress_message = 'Fetching data for {}'.format(fetch_name)
 
             # Handle Insights API call.
             if fetch_api == 'insights':
@@ -342,5 +344,5 @@ class NewRelicDriver(Measure):
 
 
 if __name__ == '__main__':
-    driver = NewRelicDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION, progress_interval=5)
+    driver = NewRelicDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION)
     driver.run()
