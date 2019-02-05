@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import json
+from dateutil import parser as date_parser
+import math
+
 import time
 from datetime import datetime, timedelta, timezone
-from functools import reduce
-from json import JSONDecodeError
+from functools import partial
 from threading import Timer
 
 import requests
@@ -13,100 +14,197 @@ from measure import Measure
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
-VERSION = '0.0.1'
+VERSION = '0.1.0'
 
 DFLT_WARMUP = 0
 DFLT_DURATION = 120
 DFLT_DELAY = 0
 
-NEWRELIC_API_KEY = str(open('/run/secrets/optune_newrelic_api_key').read()).strip()
-API_URL = 'https://api.newrelic.com/v2'
-INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
-INSTANCES_URL = '/applications/{app_id}/instances.json'
+NEWRELIC_ACCOUNT_ID = str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
+NEWRELIC_APM_API_KEY = str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
+NEWRELIC_APM_APP_ID = str(open('/run/secrets/optune_newrelic_apm_app_id').read()).strip()
+NEWRELIC_INSIGHTS_QUERY_KEY = str(open('/run/secrets/optune_newrelic_insights_query_key').read()).strip()
+APM_API_URL = 'https://api.newrelic.com/v2'
+APM_INSTANCE_LIST_URL = '/applications/{app_id}/instances.json'
+APM_INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
+INSIGHTS_API_URL = 'https://insights-api.newrelic.com/v1/accounts/{account_id}/query'
+
+
+# create a safe and desirable subset of the built-ins
+_safe_builtins = {x: eval(x) for x in "False None True abs all any bool complex divmod enumerate filter float "
+                                      "hash int iter len list map max min next pow range reversed round "
+                                      "set slice sorted str sum tuple zip".split()}
+
+# add a full set of usable math functions and constants
+_safe_builtins.update(((x, getattr(math, x)) for x in dir(math) if not x.startswith('_')))
+
+# add an empty "__builtins__" value, so that Python doesn't add one by itself
+# see https://docs.python.org/3/library/functions.html#eval
+_safe_builtins["__builtins__"] = {}
+
+
+def safe_eval(inline_code, local_variables):
+    return eval(inline_code, _safe_builtins, local_variables)
+
 
 with open('./config.yaml') as f:
     config = yaml.load(f.read())['newrelic']
 
-session = requests.Session()
-session.headers.update({'X-Api-Key': NEWRELIC_API_KEY})
+
+def prefix_url_session(prefix=None):
+    if prefix is None:
+        prefix = ""
+    else:
+        prefix = prefix.rstrip('/') + '/'
+
+    def new_request(_prefix, f, method, url, *args, **kwargs):
+        return f(method, _prefix + url, *args, **kwargs)
+
+    s = requests.Session()
+    s.request = partial(new_request, prefix, s.request)
+    return s
 
 
-def newrelic_request(path, params, retries=5, method='get', **kwargs):
-    retry = retries
-    last_error = None
-    while retry:
-        try:
-            res = getattr(session, method)(url=API_URL + path, params=params, **kwargs)
-            return res.json()
-        except Exception as e:
-            last_error = e
-            retry -= 1
-            continue
-        except JSONDecodeError as e:
-            raise Exception('Expected JSON as a response from "{}" but got something else. '
-                            'Error: {}'.format(path, str(e)))
-    if last_error:
-        raise last_error
-    raise Exception('We ran out of retries (total {}) for NewRelic request to '
-                    '"{} {}" with params "{}"'.format(retries, method.upper(), path, json.dumps(params)))
+apm_session = prefix_url_session(APM_API_URL)
+apm_session.headers.update({'X-Api-Key': NEWRELIC_APM_API_KEY})
+
+insights_session = prefix_url_session(INSIGHTS_API_URL.format(account_id=NEWRELIC_ACCOUNT_ID))
+insights_session.headers.update({'X-Query-Key': NEWRELIC_INSIGHTS_QUERY_KEY})
 
 
-class Metrics:
-    def __init__(self, metrics):
-        self.metrics = {m['name']: m for m in metrics}
+class InsightsColumn:
+    def __init__(self, contents, metadata):
+        self.contents = contents
+        self.metadata = metadata
 
-    def get_metric_values_timeseries(self, metric_name):
-        # Convert from:
-        # [{a: 1}, {a: 2}, {a: 3}]
-        # To:
-        # {a: [1, 2, 3]}
-        def fn(memo, timeslice):
-            ret = {**memo}
-            for name, value in timeslice['values'].items():
-                # Set empty array for the value we have not seen before.
-                ret.setdefault(name, []).append(value)
-            return ret
-        assert metric_name in self.metrics, 'Requested metric with name "{}" is not found. ' \
-                                            'Available metrics are ' \
-                                            '"{}"'.format(metric_name, '", "'.join(self.metrics.keys()))
-        # Convert from
-        # [{values: {a: 1, b: 2, ...}}, ...]
-        # To
-        # {a: [1, 2, ...], ...}
-        return reduce(fn, self.metrics[metric_name]['timeslices'], {})
+    def is_named(self, name):
+        if self.metadata['alias'] == name:
+            return True
+        return False
+
+    def get_value(self):
+        if 'members' in self.contents:
+            return self.contents['members']
+        else:
+            for key, v in self.contents.items():
+                if key.lower() == self.metadata['contents']['function']:
+                    return v
+        return None
 
 
-class APMException(Exception):
+class InsightsFacetedColumn:
+    def __init__(self, facets, metadata, idx):
+        self.idx = idx
+        self.facets = facets
+        self.metadata = metadata
+
+    def is_named(self, name):
+        if self.metadata['alias'] == name:
+            return True
+        return False
+
+    def get_value(self):
+        results = []
+        for facet in self.facets:
+            _data = []
+            res = {'id': facet['name'], 'data': _data}
+            for ts in facet['timeSeries']:
+                value = ts['results'][self.idx][self.metadata['contents']['function']]
+                _data.append([ts['beginTimeSeconds'], value])
+            results.append(res)
+        return results
+
+
+class InsightsException(BaseException):
     pass
 
 
-class APM:
-    def __init__(self, app_id):
-        self.app_id = app_id
+class InsightsQuery(dict):
+    def __init__(self, data):
+        dict.__init__(self, data=data)
+        self.columns = []
+        md_contents = data['metadata']['contents']
 
-    def get_instance_ids_by_query(self, query):
-        data = newrelic_request(INSTANCES_URL.format(app_id=self.app_id), params={'filter[hostname]': query})
-        if 'error' in data:
-            raise APMException(data['error']['title'])
-        return [i['id'] for i in data['application_instances']]
+        if isinstance(md_contents, list):
+            for i, metadata in enumerate(md_contents):
+                column = InsightsColumn(data['results'][i], metadata)
+                self.columns.append(column)
 
-    # Here we gather metrics per instance and extract particular submetric timeseries of particular metric.
-    # Returns [{id, data: [timeseries]}, ...]
-    def get_metric_timeseries(self, instance_ids, metric_name, value_name, from_time, to_time):
-        instance_timeseries = []
-        for inst_id in instance_ids:
-            data = newrelic_request(INSTANCE_METRICS_URL.format(app_id=self.app_id, instance_id=inst_id), params={
-                'names[]': tuple(map(lambda m: m['nr_metric'], config['metrics'].values())),
-                'from': from_time.isoformat(),
-                'to': to_time.isoformat(),
-            })
-            values_timeseries = Metrics(data['metric_data']['metrics']).get_metric_values_timeseries(metric_name)
-            try:
-                instance_timeseries.append({"id": str(inst_id),
-                                            "data": [[i, v] for i, v in enumerate(values_timeseries[value_name])]})
-            except KeyError:
-                raise KeyError('Value "{}" of metric "{}" could not be found.'.format(value_name, metric_name))
-        return instance_timeseries
+        if isinstance(md_contents, dict):
+            if 'timeSeries' in md_contents:
+                for i, col_md in enumerate(md_contents['timeSeries']['contents']):
+                    _data = None
+                    if 'facets' in data:
+                        column = InsightsFacetedColumn(data['facets'], col_md, idx=i)
+                    else:
+                        column = InsightsColumn(_data, col_md)
+                    self.columns.append(column)
+        pass
+
+    def get_column_by_name(self, column_name):
+        for column in self.columns:
+            if column.is_named(column_name):
+                return column
+        return None
+
+    def get_column_value(self, column):
+        column = self.get_column_by_name(column)
+        if column:
+            return column.get_value()
+        return None
+
+
+class APMInstances(dict):
+    def __init__(self):
+        dict.__init__(self, data=[])
+
+    def add_response_data(self, instances_response_data):
+        self['data'].append(instances_response_data)
+
+    @property
+    def instances(self):
+        for instance in self['data']:
+            yield from instance['application_instances']
+
+    @property
+    def ids(self):
+        return list(map(lambda inst: inst['id'], self.instances))
+
+
+class APMMetrics(dict):
+    def __init__(self):
+        dict.__init__(self, data=[])
+
+    def add_response_data(self, metrics_response_data):
+        self['data'].append(metrics_response_data)
+
+    def get_metric(self, name):
+        return APMMetric(name, data=self['data'])
+
+
+class APMMetric:
+    def __init__(self, metric_name, data):
+        self.metric_name = metric_name
+        self.data = data
+
+    def __getattr__(self, item):
+        instances = self.data
+        ret = []
+        for instance in instances:
+            _id = instance['instance_id']
+            r = {'id': _id, 'data': []}
+            data = r['data']
+            m = None
+            for metric in instance['metric_data']['metrics']:
+                if metric['name'] == self.metric_name:
+                    m = metric
+                    break
+            for ts in m['timeslices']:
+                value = ts['values'][item]
+                timestamp = int(date_parser.parse(ts['from']).timestamp())
+                data.append([timestamp, value])
+            ret.append(r)
+        return ret
 
 
 class NewRelicDriver(Measure):
@@ -137,26 +235,23 @@ class NewRelicDriver(Measure):
         duration = int(control.get('duration', DFLT_DURATION))
         delay = int(control.get('delay', DFLT_DELAY))
 
-        assert config['app_id'], 'You did not provide APM application id to query metrics from.'
-        apm = APM(app_id=config['app_id'])
-
         self.time_to_wait = warmup + duration + delay
         self.time_left = self.time_to_wait
         self.start_timer()
 
-        # warmup nap
+        # Warmup nap
         if warmup > 0:
-            msg = 'WARMUP: sleeping {} seconds'.format(warmup)
-            self.progress_message = msg
             self.progress = 0
+            self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
             time.sleep(warmup)
 
-        # Wait for duration period before gathering measurements
-        self.progress_message = 'DURATION: waiting {} seconds to gather measurements'.format(duration)
+        # Wait before gathering measurements (historical data)
+        self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
         time.sleep(duration)
 
         metrics = {}
-        start = datetime.now(timezone.utc)
+        measure_to = datetime.now(timezone.utc).replace(microsecond=0)
+        measure_from = measure_to - timedelta(seconds=duration)
 
         # Delay measurements
         self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
@@ -164,17 +259,69 @@ class NewRelicDriver(Measure):
         self.stop_timer()
 
         self.progress_message = 'Gathering measurements'
-        cmetrics = config['metrics']
-        for i, (name, metric) in enumerate(cmetrics.items()):
-            instance_ids = apm.get_instance_ids_by_query(metric.get('nr_hostname_query',
-                                                                    config.get('nr_hostname_query')))
-            self.progress = 80 + int(i / len(cmetrics) * 20)
-            metrics[name] = {
-                "values": apm.get_metric_timeseries(instance_ids=instance_ids,
-                                                    metric_name=metric['nr_metric'], value_name=metric['nr_value'],
-                                                    from_time=start - timedelta(seconds=duration),
-                                                    to_time=start)
-            }
+        config_fetches = config['fetch']
+        config_metrics = config['metrics']
+
+        fetches = {}
+        for fetch in config_fetches:
+            fetch_name = fetch['name']
+            fetch_api = fetch['api']
+
+            # Handle Insights API call.
+            if fetch_api == 'insights':
+                query = fetch['query'].format(from_time=measure_from.isoformat(),
+                                              to_time=measure_to.isoformat())
+                response = insights_session.get('', params=dict(nrql=query))
+                data = response.json()
+                if 'error' in data:
+                    raise InsightsException(
+                        '{}\nIn Query:\n{}'.format(data['error'], query))
+                fetches[fetch_name] = InsightsQuery(data)
+
+            # Handle APM Instance List API call.
+            if fetch_api == 'apm_instances_list':
+                hostnames = safe_eval(fetch['hostnames'],
+                                      local_variables=fetches)
+                hosts = APMInstances()
+                for hostname in hostnames:
+                    response = apm_session.get(APM_INSTANCE_LIST_URL.format(app_id=NEWRELIC_APM_APP_ID),
+                                               params={'filter[hostname]': hostname})
+                    hosts.add_response_data(response.json())
+                fetches[fetch_name] = hosts
+
+            # Handle APM Metrics Data API call.
+            if fetch_api == 'apm_metrics_data':
+                fetch_metrics = fetch['metrics']
+
+                def get_metric_values(_metrics):
+                    for m in _metrics:
+                        yield from m['values']
+
+                fetches[fetch_name] = a = APMMetrics()
+                instance_ids = safe_eval(fetch['instance_ids'], local_variables=fetches)
+                for instance_id in instance_ids:
+                    response = apm_session.get(APM_INSTANCE_METRICS_URL.format(
+                        app_id=NEWRELIC_APM_APP_ID,
+                        instance_id=instance_id,
+                    ), params={
+                        'names[]': list(map(lambda m: m['name'], fetch_metrics)),
+                        'values[]': list(get_metric_values(fetch_metrics)),
+                        'from': measure_from.isoformat(),
+                        'to': measure_to.isoformat(),
+                        'period': 60,
+                        'summarize': False,
+                        'raw': True,
+                    })
+                    a.add_response_data({'instance_id': instance_id, **response.json()})
+
+        for config_metric in config_metrics:
+            excluded = ['name']
+            compiled_metric = {**dict(filter(lambda m: m[0] not in excluded, config_metric.items()))}
+            if 'values' in config_metric:
+                compiled_metric['values'] = safe_eval(config_metric['values'], fetches)
+            elif 'value' in config_metric:
+                compiled_metric['value'] = safe_eval(config_metric['value'], fetches)
+            metrics[config_metric['name']] = compiled_metric
 
         self.progress = 100
         self.progress_message = 'Measurements completed'
@@ -184,8 +331,6 @@ class NewRelicDriver(Measure):
 
     def describe(self):
         metrics = {}
-        for k, v in config['metrics'].items():
-            metrics[k] = dict((a, b) for a, b in v.items() if not a.startswith('nr_'))
         return metrics
 
     def handle_cancel(self, **kwargs):
@@ -194,5 +339,5 @@ class NewRelicDriver(Measure):
 
 
 if __name__ == '__main__':
-    driver = NewRelicDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION, progress_interval=1)
+    driver = NewRelicDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION, progress_interval=5)
     driver.run()
