@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+
 from dateutil import parser as date_parser
 import math
 
@@ -28,7 +30,6 @@ APM_API_URL = 'https://api.newrelic.com/v2'
 APM_INSTANCE_LIST_URL = '/applications/{app_id}/instances.json'
 APM_INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
 INSIGHTS_API_URL = 'https://insights-api.newrelic.com/v1/accounts/{account_id}/query'
-
 
 # create a safe and desirable subset of the built-ins
 _safe_builtins = {x: eval(x) for x in "False None True abs all any bool complex divmod enumerate filter float "
@@ -73,6 +74,7 @@ insights_session.headers.update({'X-Query-Key': NEWRELIC_INSIGHTS_QUERY_KEY})
 
 
 class InsightsColumn:
+
     def __init__(self, contents, metadata):
         self.contents = contents
         self.metadata = metadata
@@ -93,6 +95,7 @@ class InsightsColumn:
 
 
 class InsightsFacetedColumn:
+
     def __init__(self, facets, metadata, idx):
         self.idx = idx
         self.facets = facets
@@ -120,6 +123,7 @@ class InsightsException(BaseException):
 
 
 class InsightsQuery(dict):
+
     def __init__(self, data):
         dict.__init__(self, data=data)
         self.columns = []
@@ -153,6 +157,7 @@ class InsightsQuery(dict):
 
 
 class APMInstances(dict):
+
     def __init__(self):
         dict.__init__(self, data=[])
 
@@ -170,6 +175,7 @@ class APMInstances(dict):
 
 
 class APMMetrics(dict):
+
     def __init__(self):
         dict.__init__(self, data=[])
 
@@ -181,6 +187,7 @@ class APMMetrics(dict):
 
 
 class APMMetric:
+
     def __init__(self, metric_name, data):
         self.metric_name = metric_name
         self.data = data
@@ -225,6 +232,7 @@ class NewRelicDriver(Measure):
         self.start_timer()
 
     def measure(self):
+        skip_sleep = os.environ.get('SKIP_SLEEP', False)
         self.progress_message = 'Measurements started'
         self.print_progress()
 
@@ -241,11 +249,13 @@ class NewRelicDriver(Measure):
         if warmup > 0:
             self.progress = 0
             self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
-            time.sleep(warmup)
+            if not skip_sleep:
+                time.sleep(warmup)
 
         # Wait before gathering measurements (historical data)
         self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
-        time.sleep(duration)
+        if not skip_sleep:
+            time.sleep(duration)
 
         metrics = {}
         measure_to = datetime.now(timezone.utc).replace(microsecond=0)
@@ -253,7 +263,8 @@ class NewRelicDriver(Measure):
 
         # Delay measurements
         self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
-        time.sleep(delay)
+        if not skip_sleep:
+            time.sleep(delay)
         self.stop_timer()
 
         config_fetches = config['fetch']
