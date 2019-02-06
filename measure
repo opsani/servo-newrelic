@@ -110,7 +110,7 @@ class InsightsFacetedColumn:
         results = []
         for facet in self.facets:
             _data = []
-            res = {'id': facet['name'], 'data': _data}
+            res = {'id': str(facet['name']), 'data': _data}
             for ts in facet['timeSeries']:
                 value = ts['results'][self.idx][self.metadata['contents']['function']]
                 _data.append([ts['beginTimeSeconds'], value])
@@ -197,7 +197,7 @@ class APMMetric:
         ret = []
         for instance in instances:
             _id = instance['instance_id']
-            r = {'id': _id, 'data': []}
+            r = {'id': str(_id), 'data': []}
             data = r['data']
             m = None
             for metric in instance['metric_data']['metrics']:
