@@ -1,4 +1,5 @@
 newrelic:
+  instance_ids_cmd: ./adjust --query $APP_ID | jq .monitoring
   fetch:
     - name: active_canary_hostnames
       api: insights
