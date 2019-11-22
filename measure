@@ -334,7 +334,7 @@ class NewRelicDriver(Measure):
                         'summarize': False,
                         'raw': True,
                     })
-                    a.add_response_data({'instance_id': instance_id, **response.json()})
+                    a.add_response_data({'instance_id': apm_instance_id, **response.json()})
 
         for config_metric in config_metrics:
             excluded = ['name']
