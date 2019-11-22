@@ -226,7 +226,9 @@ class APMMetric:
             ret.append(r)
         return ret
 
+
 apm_id_hostname_map = dict()
+
 
 class NewRelicDriver(Measure):
     progress_timer = None
@@ -315,7 +317,7 @@ class NewRelicDriver(Measure):
                     data = response.json()
                     hosts.add_response_data(data)
                     apmid = next(hosts.get_instances([data]))['id']
-                    fullid = '{}-{}'.format(apmid, hostname)
+                    fullid = '{}~{}'.format(apmid, hostname)
                     apm_id_hostname_map.setdefault(apmid, fullid)
                     apm_id_hostname_map.setdefault(hostname, fullid)
                 fetches[fetch_name] = hosts
