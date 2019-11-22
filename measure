@@ -122,7 +122,7 @@ class InsightsFacetedColumn:
         results = []
         for facet in self.facets:
             _data = []
-            res = {'id': str(facet['name']), 'data': _data}
+            res = {'id': str(apm_id_hostname_map.get(facet['name'], facet['name'])), 'data': _data}
             for ts in facet['timeSeries']:
                 value = ts['results'][self.idx][self.metadata['contents']['function']]
                 _data.append([ts['beginTimeSeconds'], value])
@@ -176,10 +176,13 @@ class APMInstances(dict):
     def add_response_data(self, instances_response_data):
         self['data'].append(instances_response_data)
 
+    def get_instances(self, instances_response_data):
+        for instance in instances_response_data:
+            yield from instance['application_instances']
+
     @property
     def instances(self):
-        for instance in self['data']:
-            yield from instance['application_instances']
+        yield from self.get_instances(self['data'])
 
     @property
     def ids(self):
@@ -223,6 +226,7 @@ class APMMetric:
             ret.append(r)
         return ret
 
+apm_id_hostname_map = dict()
 
 class NewRelicDriver(Measure):
     progress_timer = None
@@ -308,7 +312,12 @@ class NewRelicDriver(Measure):
                 for hostname in hostnames:
                     response = apm_session.get(APM_INSTANCE_LIST_URL.format(app_id=NEWRELIC_APM_APP_ID),
                                                params={'filter[hostname]': hostname})
-                    hosts.add_response_data(response.json())
+                    data = response.json()
+                    hosts.add_response_data(data)
+                    apmid = next(hosts.get_instances([data]))['id']
+                    fullid = '{}-{}'.format(apmid, hostname)
+                    apm_id_hostname_map.setdefault(apmid, fullid)
+                    apm_id_hostname_map.setdefault(hostname, fullid)
                 fetches[fetch_name] = hosts
 
             # Handle APM Metrics Data API call.
@@ -334,7 +343,10 @@ class NewRelicDriver(Measure):
                         'summarize': False,
                         'raw': True,
                     })
-                    a.add_response_data({'instance_id': instance_id, **response.json()})
+                    a.add_response_data({
+                        **response.json(),
+                        'instance_id': apm_id_hostname_map.get(apm_instance_id, apm_instance_id),
+                    })
 
         for config_metric in config_metrics:
             excluded = ['name']
