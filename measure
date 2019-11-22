@@ -337,13 +337,22 @@ class NewRelicDriver(Measure):
                     a.add_response_data({'instance_id': apm_instance_id, **response.json()})
 
         for config_metric in config_metrics:
+            name = config_metric['name']
             excluded = ['name']
             compiled_metric = {**dict(filter(lambda m: m[0] not in excluded, config_metric.items()))}
             if 'values' in config_metric:
-                compiled_metric['values'] = safe_eval(config_metric['values'], fetches)
+                val = safe_eval(config_metric['values'], fetches)
+                assert isinstance(val, list), \
+                    'List of per-instance timeseries was expected in a config file formula ' \
+                    'under key "values" for metric "{}". Got value of type "{}" instead.'.format(name, type(val))
+                compiled_metric['values'] = val
             elif 'value' in config_metric:
-                compiled_metric['value'] = safe_eval(config_metric['value'], fetches)
-            metrics[config_metric['name']] = compiled_metric
+                val = safe_eval(config_metric['value'], fetches)
+                assert isinstance(val, (int, float, str, bool)), \
+                    'Scalar value was expected in a config file formula ' \
+                    'under key "value" for metric "{}". Got value of type "{}" instead.'.format(name, type(val))
+                compiled_metric['value'] = val
+            metrics[name] = compiled_metric
 
         self.progress = 100
         self.progress_message = 'Measurements completed'
