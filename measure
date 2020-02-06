@@ -34,7 +34,8 @@ APM_INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metri
 INSIGHTS_API_URL = 'https://insights-api.newrelic.com/v1/accounts/{account_id}/query'
 
 # create a safe and desirable subset of the built-ins
-_safe_builtins = {x: eval(x) for x in "False None True abs all any bool complex divmod enumerate filter float "
+# disabled bandit potentially unsafe eval warning with nosec as args are literals
+_safe_builtins = {x: eval(x) for x in "False None True abs all any bool complex divmod enumerate filter float " # nosec b307
                                       "hash int iter len list map max min next pow range reversed round "
                                       "set slice sorted str sum tuple zip".split()}
 
@@ -47,11 +48,12 @@ _safe_builtins["__builtins__"] = {}
 
 
 def safe_eval(inline_code, local_variables):
-    return eval(inline_code, _safe_builtins, local_variables)
+    # disabled bandit potentially unsafe eval warning with nosec as safety is implemented by this method
+    return eval(inline_code, _safe_builtins, local_variables) # nosec b307
 
 
 with open('./config.yaml') as f:
-    config = yaml.load(f.read())['newrelic']
+    config = yaml.safe_load(f.read())['newrelic']
 
 
 def url_session(prefix=None):
