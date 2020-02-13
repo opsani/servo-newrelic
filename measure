@@ -244,6 +244,13 @@ class NewRelicDriver(Measure):
         self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
         self.start_timer()
 
+    # Disable the progress timer by overloading the superclass
+    # The progress timer and Vegeta get caught in a race that can
+    # result in multiple progress updates getting written onto the
+    # same line of stdout, resulting in invalid JSON
+    def start_progress_timer(self):
+        pass
+    
     def measure(self):
         skip_sleep = os.environ.get('SKIP_SLEEP', False)
         self.print_progress('Measurements started')
