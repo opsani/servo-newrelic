@@ -367,7 +367,7 @@ class NewRelicDriver(Measure):
         self.debug(err)
         self.print_measure_error(err, ST_FAILED)
 
-        sys.exit(3)
+        sys.exit(0)
 
 
 if __name__ == '__main__':
