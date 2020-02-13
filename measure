@@ -246,8 +246,7 @@ class NewRelicDriver(Measure):
 
     def measure(self):
         skip_sleep = os.environ.get('SKIP_SLEEP', False)
-        self.progress_message = 'Measurements started'
-        self.print_progress()
+        self.print_progress('Measurements started')
 
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
@@ -261,12 +260,12 @@ class NewRelicDriver(Measure):
         # Warmup nap
         if warmup > 0:
             self.progress = 0
-            self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
+            self.print_progress(f'WARMUP: sleeping {warmup} seconds')
             if not skip_sleep:
                 time.sleep(warmup)
 
         # Wait before gathering measurements (historical data)
-        self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
+        self.print_progress(f'DURATION: waiting {duration} seconds for measurements')
         if not skip_sleep:
             time.sleep(duration)
 
@@ -275,7 +274,7 @@ class NewRelicDriver(Measure):
         measure_from = measure_to - timedelta(seconds=duration)
 
         # Delay measurements
-        self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
+        self.print_progress(f'DELAY: sleeping {delay} seconds')
         if not skip_sleep:
             time.sleep(delay)
         self.stop_timer()
@@ -289,7 +288,7 @@ class NewRelicDriver(Measure):
             fetch_name = fetch['name']
             fetch_api = fetch['api']
             self.progress = 80 + ((i / config_fetches_len) * 20)
-            self.progress_message = 'Fetching data for {}'.format(fetch_name)
+            self.print_progress(f'Fetching data for {fetch_name}')
 
             # Handle Insights API call.
             if fetch_api == 'insights':
@@ -347,8 +346,7 @@ class NewRelicDriver(Measure):
             metrics[config_metric['name']] = compiled_metric
 
         self.progress = 100
-        self.progress_message = 'Measurements completed'
-        self.print_progress()
+        self.print_progress('Measurements completed')
 
         return metrics, {}
 
