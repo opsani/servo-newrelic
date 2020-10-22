@@ -373,9 +373,12 @@ class NewRelicDriver(Measure):
             metrics[metric['name']] = keys
         return metrics
 
-    def handle_cancel(self, **kwargs):
-        print('Cancelling measurements')
-        quit(0)
+    def handle_cancel(self, signal, frame):
+        err = 'Exiting due to signal: {}'.format(signal)
+        self.debug(err)
+        self.print_measure_error(err, ST_FAILED)
+
+        sys.exit(0)
 
     def run_instance_ids_cmd(self, instance_ids_cmd):
         env = dict(os.environ)
