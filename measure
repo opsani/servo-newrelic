@@ -16,7 +16,7 @@ import yaml
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 
-from measure import Measure
+from measure import Measure, ST_FAILED
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
@@ -376,7 +376,7 @@ class NewRelicDriver(Measure):
     def handle_cancel(self, signal, frame):
         err = 'Exiting due to signal: {}'.format(signal)
         self.debug(err)
-        self.print_measure_error(err, ST_FAILED)
+        self.print_measure_error(err)
 
         sys.exit(0)
 
