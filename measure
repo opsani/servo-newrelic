@@ -377,7 +377,7 @@ class NewRelicDriver(Measure):
     def handle_cancel(self, signal, frame):
         err = 'Exiting due to signal: {}'.format(signal)
         self.debug(err)
-        self.print_measure_error(err)
+        self.print_measure_error(err, ST_FAILED)
 
         sys.exit(0)
 
