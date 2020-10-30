@@ -239,6 +239,7 @@ class NewRelicDriver(Measure):
         self.stop_timer()
         self.time_left -= 1
         self.progress_timer = Timer(1, self.update_progress)
+        self.progress_timer.daemon = True
         self.progress_timer.start()
 
     def update_progress(self):
