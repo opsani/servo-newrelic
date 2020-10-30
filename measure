@@ -246,7 +246,7 @@ class NewRelicDriver(Measure):
         self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
         self.start_timer()
 
-    def start_progress_timer():
+    def start_progress_timer(seld):
         pass
 
     def measure(self):
