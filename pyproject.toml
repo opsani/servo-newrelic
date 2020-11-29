@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "servo-newrelic"
+version = "0.1.0"
+description = "A servo connector that measures metrics from New Relic"
+authors = ["Fred Sharp <fred@opsani.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/opsani/servo-newrelic"
+repository = "https://github.com/opsani/servo-newrelic"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+servox = "^0.8.3"
+python-dateutil = "^2.8.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "^6.1.2"
+pytest-asyncio = "^0.14.0"
+asynctest = {git = "https://github.com/Martiusweb/asynctest.git", rev = "py3.8"}
+
+[tool.poetry.plugins."servo.connectors"]
+"servo-newrelic" = "servo_newrelic:NewrelicConnector"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
