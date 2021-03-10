@@ -41,10 +41,11 @@ DFLT_WARMUP = 0
 DFLT_DURATION = 120
 DFLT_DELAY = 0
 
-NEWRELIC_ACCOUNT_ID = str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
-NEWRELIC_APM_API_KEY = str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
-NEWRELIC_APM_APP_ID = str(open('/run/secrets/optune_newrelic_apm_app_id').read()).strip()
-NEWRELIC_INSIGHTS_QUERY_KEY = str(open('/run/secrets/optune_newrelic_insights_query_key').read()).strip()
+# TODO: should env var credential support be kept after slo dev?
+NEWRELIC_ACCOUNT_ID = os.environ.get('NEWRELIC_ACCOUNT_ID') or str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
+NEWRELIC_APM_API_KEY = os.environ.get('NEWRELIC_APM_API_KEY') or str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
+NEWRELIC_APM_APP_ID = os.environ.get('NEWRELIC_APM_APP_ID') or str(open('/run/secrets/optune_newrelic_apm_app_id').read()).strip()
+NEWRELIC_INSIGHTS_QUERY_KEY = os.environ.get('NEWRELIC_INSIGHTS_QUERY_KEY') or str(open('/run/secrets/optune_newrelic_insights_query_key').read()).strip()
 APM_API_URL = 'https://api.newrelic.com/v2'
 APM_INSTANCE_LIST_URL = '/applications/{app_id}/instances.json'
 APM_INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
@@ -145,7 +146,7 @@ def aggregate_metric_values_to_scalar(
             continue
 
         # Pull metric values from timestamps, filter out falsey values; 0, 0.0
-        single_inst_vals = [v[1] for v in val_list if v[1]] # TODO: NaN check?
+        single_inst_vals = [decimal.Decimal(v[1]) for v in val_list if v[1]] # TODO: NaN check?
         if not single_inst_vals:
             continue
 
@@ -175,7 +176,6 @@ class FastFailConfig(pydantic.BaseModel):
 
     @pydantic.validator('span', pre=True, always=True)
     def span_defaults_to_period(cls, v, *, values, **kwargs):
-        print('test')
         if v is None:
             return values['period']
         return v
@@ -187,6 +187,9 @@ class BaseSloCondition(pydantic.BaseModel, abc.ABC):
     threshold_multiplier: decimal.Decimal = decimal.Decimal(1)
     keep: pydantic.constr(strip_whitespace=True, regex='above|below') = 'below'
     for_: int = pydantic.Field(default=1, alias='for', ge=1)
+    
+    class Config:
+        extra = 'forbid'
 
     def __str__(self) -> str:
         if self.description is None:
@@ -347,7 +350,7 @@ class NewRelicDriver(Measure):
         super().__init__(*args, **kwargs)
 
         with open('./config.yaml') as f:
-            self.config = yaml.load(f.read())['newrelic']
+            self.config = yaml.load(f.read(), Loader=yaml.SafeLoader)['newrelic']
 
         self.fast_fail_config: FastFailConfig = FastFailConfig.parse_obj(self.config.get('fast_fail', {}))
 
@@ -371,10 +374,6 @@ class NewRelicDriver(Measure):
         self.start_timer()
 
     def measure(self):
-        skip_sleep = os.environ.get('SKIP_SLEEP', False)
-        self.progress_message = 'Measurements started'
-        self.print_progress()
-
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
         duration = int(control.get('duration', DFLT_DURATION))
@@ -393,7 +392,7 @@ class NewRelicDriver(Measure):
                 results = self.check_slo(slo_input)        
                 if (failed_results := results['failed']):
                     slo_message = ' | '.join([
-                        f"{fr['condition']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
+                        f"{fr['condition_repr']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
                         for fr in failed_results
                     ])
 
@@ -407,7 +406,7 @@ class NewRelicDriver(Measure):
 
                 # Log success results to driver STDOUT so they can be seen when servo is set to verbose
                 # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
-                print(json.dumps({'slo_results': results }), flush=True)
+                print(json.dumps({'slo_results': results }, default=str), flush=True)
                 
                 # NOTE: Base measure class always includes 'metrics' key with return value of this function,
                 #   override the functionality if we are in SLO check mode
@@ -417,6 +416,10 @@ class NewRelicDriver(Measure):
             else:
                 # TODO: introduce timer or async task 
                 pass
+
+        skip_sleep = os.environ.get('SKIP_SLEEP', False)
+        self.progress_message = 'Measurements started'
+        self.print_progress()
 
         self.time_to_wait = warmup + duration + delay
         self.time_left = self.time_to_wait
@@ -602,8 +605,8 @@ class NewRelicDriver(Measure):
         failed_results = []
         passed_results = []
         for index, condition in enumerate(slo_input.conditions):
-            # Index is used as a psuedo ID to track failures accros slo_check calls
-            result = { 'condition': condition, 'index': index }
+            # Index is used as a psuedo ID to track failures across slo_check calls
+            result = { 'condition': condition.dict(), 'condition_repr': str(condition), 'index': index }
 
             # try to produce a scalar value from one or more metric data points, store into result['metric_scalar']
             if not aggregate_metric_values_to_scalar(condition.metric, metrics, result, is_threshold=False):
@@ -648,7 +651,7 @@ class NewRelicDriver(Measure):
         if results:
             out["results"] = results
 
-        print(json.dumps(out), flush=True)
+        print(json.dumps(out, default=str), flush=True)
 
 
 if __name__ == '__main__':
