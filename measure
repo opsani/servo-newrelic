@@ -11,6 +11,7 @@ import operator
 import statistics
 
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from threading import Timer
@@ -333,14 +334,15 @@ class APMMetric:
             r = {'id': str(_id), 'data': []}
             data = r['data']
             m = None
-            for metric in instance['metric_data']['metrics']:
+            for metric in instance.get('metric_data', {}).get('metrics', []):
                 if metric['name'] == self.metric_name:
                     m = metric
                     break
-            for ts in m['timeslices']:
-                value = ts['values'][item]
-                timestamp = int(date_parser.parse(ts['from']).timestamp())
-                data.append([timestamp, value])
+            if m is not None:
+                for ts in m['timeslices']:
+                    value = ts['values'][item]
+                    timestamp = int(date_parser.parse(ts['from']).timestamp())
+                    data.append([timestamp, value])
             ret.append(r)
         return ret
 
@@ -358,6 +360,10 @@ class NewRelicDriver(Measure):
     time_to_wait = 0
     time_left = 0
 
+    slo_failed_counters: Dict[int, int] = defaultdict(int)
+    """Dictionary of SLO Condition index to failure counter mapping
+    """
+
     def stop_timer(self):
         if self.progress_timer:
             self.progress_timer.cancel()
@@ -374,6 +380,9 @@ class NewRelicDriver(Measure):
         self.start_timer()
 
     def measure(self):
+        sleep_fn = time.sleep # overriden when slo provided
+        skip_sleep = os.environ.get('SKIP_SLEEP', False) # NOTE: this skips SLO checking as well as sleeps
+
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
         duration = int(control.get('duration', DFLT_DURATION))
@@ -396,8 +405,7 @@ class NewRelicDriver(Measure):
                         for fr in failed_results
                     ])
 
-                    # NOTE: base measure.py hard codes status="ok" for anything returned successfully from measure
-                    #   and its exception handling hard codes status="500" with no reason included.
+                    # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
                     #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
                     #   in other connectors
                     self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
@@ -413,11 +421,10 @@ class NewRelicDriver(Measure):
                 self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
                 print('{"status": "ok"}', flush=True)
                 sys.exit(0)
-            else:
-                # TODO: introduce timer or async task 
-                pass
+            elif self.fast_fail_config.disabled != 1:
+                self.slo_skip_remaining = self.fast_fail_config.skip.total_seconds()
+                sleep_fn = partial(self.slo_check_sleep, slo_input=slo_input)
 
-        skip_sleep = os.environ.get('SKIP_SLEEP', False)
         self.progress_message = 'Measurements started'
         self.print_progress()
 
@@ -427,15 +434,14 @@ class NewRelicDriver(Measure):
 
         # Warmup nap
         if warmup > 0:
-            self.progress = 0
             self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
             if not skip_sleep:
-                time.sleep(warmup)
+                sleep_fn(warmup)
 
         # Wait before gathering measurements (historical data)
         self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
         if not skip_sleep:
-            time.sleep(duration)
+            sleep_fn(duration)
 
         measure_to = datetime.now(timezone.utc).replace(microsecond=0)
         measure_from = measure_to - timedelta(seconds=duration)
@@ -443,7 +449,7 @@ class NewRelicDriver(Measure):
         # Delay measurements
         self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
         if not skip_sleep:
-            time.sleep(delay)
+            sleep_fn(delay)
         self.stop_timer()
 
         metrics = self.get_metrics(measure_from, measure_to, update_progress=True)
@@ -634,6 +640,57 @@ class NewRelicDriver(Measure):
                 failed_results.append(result)
 
         return {'missing_or_nan': nan_results, 'failed': failed_results, 'passed': passed_results}
+
+
+    def slo_check_sleep(self, secs: float, slo_input: SloInput) -> None:
+        """Pass through to time.sleep that divides the duration so that SLO checks are run
+        periodically based on the configuration of the fast_fail period
+        """
+        end_at = datetime.now() + timedelta(seconds=secs)
+        # Skip SLO checks for configured duration
+        if self.slo_skip_remaining:
+            if self.slo_skip_remaining > secs:
+                self.slo_skip_remaining -= secs
+                time.sleep(secs)
+                return
+            time.sleep(self.slo_skip_remaining)
+            self.slo_skip_remaining = 0
+
+        while (loop_start := datetime.now()) < end_at:
+            results = self.check_slo(slo_input)
+            failed_indexes = set(fr['index'] for fr in results['failed'])
+
+            raise_for = False
+            for index, condition in enumerate(slo_input.conditions):
+                if index in failed_indexes:
+                    self.slo_failed_counters[index] += 1
+                    if self.slo_failed_counters[index] == condition.for_:
+                        raise_for = True
+                else:
+                    self.slo_failed_counters.pop(index, None)
+
+            if raise_for:
+                slo_message = ' | '.join([
+                    f"{fr['condition_repr']} {fr['message']} x{self.slo_failed_counters[fr['index']]}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
+                    for fr in results['failed']
+                ])
+
+                # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
+                #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
+                #   in other connectors
+                self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
+                self.print_slo_error(slo_message, reason='slo-violation', status='rejected', results=results)
+                sys.exit(1)
+            else:
+                # Log success results to driver STDOUT so they can be seen when servo is set to verbose
+                # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
+                print(json.dumps({'slo_results': results }, default=str), flush=True)
+
+            # account for time taken by SLO check, clamp negative timedeltas to 0
+            remaining_period = max(0, (self.fast_fail_config.period - (datetime.now() - loop_start)).total_seconds())
+            remaining_total = max(0, (end_at - datetime.now()).total_seconds())
+            next_sleep = min(remaining_period, remaining_total)
+            time.sleep(next_sleep)
 
 
     def print_slo_error(self, message, reason, status='failed', results=None):
