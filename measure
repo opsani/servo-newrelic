@@ -400,7 +400,7 @@ class NewRelicDriver(Measure):
             if slo_check == 1:
                 results = self.check_slo(slo_input)        
                 if (failed_results := results['failed']):
-                    slo_message = ' | '.join([
+                    slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
                         f"{fr['condition_repr']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
                         for fr in failed_results
                     ])
@@ -639,7 +639,13 @@ class NewRelicDriver(Measure):
                 result['message'] = f'keep {condition.keep} not met'
                 failed_results.append(result)
 
-        return {'missing_or_nan': nan_results, 'failed': failed_results, 'passed': passed_results}
+        return {
+            'from': str(measure_from),
+            'to': str(measure_to),
+            'missing_or_nan': nan_results, 
+            'failed': failed_results, 
+            'passed': passed_results
+        }
 
 
     def slo_check_sleep(self, secs: float, slo_input: SloInput) -> None:
@@ -670,7 +676,7 @@ class NewRelicDriver(Measure):
                     self.slo_failed_counters.pop(index, None)
 
             if raise_for:
-                slo_message = ' | '.join([
+                slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
                     f"{fr['condition_repr']} {fr['message']} x{self.slo_failed_counters[fr['index']]}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
                     for fr in results['failed']
                 ])
@@ -679,7 +685,7 @@ class NewRelicDriver(Measure):
                 #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
                 #   in other connectors
                 self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
-                self.print_slo_error(slo_message, reason='slo-violation', status='rejected', results=results)
+                self.print_slo_error(slo_message, reason='slo-violation', status='aborted', results=results)
                 sys.exit(1)
             else:
                 # Log success results to driver STDOUT so they can be seen when servo is set to verbose
