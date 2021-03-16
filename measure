@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
-import abc
-import decimal
 import json
 import os
 import subprocess
 import sys
 from dateutil import parser as date_parser
 import math
-import operator
-import statistics
 
 import time
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from threading import Timer
 
-import pydantic
 import requests
 import yaml
 from requests.adapters import HTTPAdapter
-from typing import Any, Dict, List, Optional, Union
 from urllib3 import Retry
 
 from measure import Measure, ST_FAILED
+from slo import FastFailConfig, SloChecker
 
 class MeasureError(Exception):
     """base class for error exceptions defined by drivers.
@@ -98,239 +92,6 @@ apm_session.headers.update({'X-Api-Key': NEWRELIC_APM_API_KEY})
 
 insights_session = url_session(INSIGHTS_API_URL.format(account_id=NEWRELIC_ACCOUNT_ID))
 insights_session.headers.update({'X-Query-Key': NEWRELIC_INSIGHTS_QUERY_KEY})
-
-class FastFailConfig(pydantic.BaseModel):
-    disabled: pydantic.conint(ge=0, le=1, multiple_of=1) = 0
-    period: timedelta = timedelta(seconds=60)
-    span: timedelta = None
-    skip: timedelta = timedelta(seconds=0)
-    
-    class Config:
-        extra = 'forbid'
-
-    @pydantic.validator('span', pre=True, always=True)
-    def span_defaults_to_period(cls, v, *, values, **kwargs):
-        if v is None:
-            return values['period']
-        return v
-
-
-class BaseSloCondition(pydantic.BaseModel, abc.ABC):
-    description: Optional[str] = None
-    metric: str
-    threshold_multiplier: decimal.Decimal = decimal.Decimal(1)
-    keep: pydantic.constr(strip_whitespace=True, regex='above|below') = 'below'
-    for_: int = pydantic.Field(default=1, alias='for', ge=1)
-    
-    class Config:
-        extra = 'forbid'
-
-    @abc.abstractclassmethod
-    def get_values(self, metrics: Dict[str, Any], result: "SloResult") -> bool:
-        """Produce all scalar values needed to perform the configured check or return False to indicate
-        further processing is not possible
-
-        Args:
-            metrics (Dict[str, Any]): The retrieved metrics to evaluate this condition against
-            result (SloResult): Object onto which condition information is marshalled for computation and reporting.
-                Most importantly, `result.metric_scalar` and `result.threshold_product` will always be set on a successful
-                (True) result. Other properties set are purely for reporting and debug purposes
-
-        Returns:
-            bool: True if the values are ready to check, False to indicate further processing is not possible
-        """
-        ...
-
-    def __str__(self) -> str:
-        if self.description is None:
-            return f"({self.metric})"
-        return f"({self.metric} -> {self.description})"
-
-    def check_values(self, metric_value: decimal.Decimal, threshold_value: decimal.Decimal) -> bool:
-        """Compares the provided metric and threshold decimal values based on the configured keep
-
-        Returns: bool: Indicates whether the values satisfy the configured keep condition
-        """
-        check_op = operator.lt if self.keep == 'below' else operator.gt
-        return check_op(metric_value, threshold_value)
-
-    def _get_metric_value(self, metrics, result: "SloResult") -> bool:
-        """Produce the scalar value for the configured metric and store into result.metric_scalar. 
-        Should only be invoked by a subclass in get_values
-
-        Returns: bool: True if metric value is ready to check, False to indicate further processing is not possible
-        """
-        return aggregate_metric_values_to_scalar(self.metric, metrics, result, is_threshold=False)
-
-class ThresholdConstantCondition(BaseSloCondition):
-    threshold: decimal.Decimal
-
-    def get_values(self, metrics, result: "SloResult") -> bool:
-        if not self._get_metric_value(metrics, result):
-            return False
-
-        result.threshold_product = self.threshold * self.threshold_multiplier
-        return True
-
-class ThresholdMetricCondition(BaseSloCondition):
-    threshold_metric: str
-
-    def get_values(self, metrics, result: "SloResult") -> bool:
-        if not self._get_metric_value(metrics, result):
-            return False
-
-        # try to produce a scalar, store into result.threshold_metric_scalar
-        if not aggregate_metric_values_to_scalar(self.threshold_metric, metrics, result, is_threshold=True):
-            return False
-
-        result.threshold_product = result.threshold_metric_scalar * self.threshold_multiplier
-        return True
-
-class SloInput(pydantic.BaseModel):
-    conditions: List[Union[ThresholdConstantCondition, ThresholdMetricCondition]]
-
-# Inherit from pydantic model for simple json serialization
-class SloResult(pydantic.BaseModel):
-    index: int
-    condition: Union[ThresholdConstantCondition, ThresholdMetricCondition]
-    message: str = ''
-    metric_scalar: Optional[decimal.Decimal] = None
-    threshold_product: Optional[decimal.Decimal] = None
-    threshold_metric_scalar: Optional[decimal.Decimal] = None
-
-    # def __str__(self) -> str:
-    def to_message(self, counters: Dict[int, int] = {}):
-        x_num = counters.get(self.index, '')
-        if x_num != '':
-            x_num = f' x{x_num}'
-        return f"{self.condition} {self.message}{x_num}. computed values: metric {self.metric_scalar} threshold {self.threshold_product}"
-
-# f"{fr['condition_repr']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
-# f"{fr['condition_repr']} {fr['message']} x{self.slo_failed_counters[fr['index']]}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
-
-class SloCheck(pydantic.BaseModel):
-    from_: datetime = pydantic.Field(..., alias='from')
-    to: datetime
-    passed: List[SloResult] = []
-    failed: List[SloResult] = []
-    missing: List[SloResult] = []
-
-    slo_input: SloInput = pydantic.PrivateAttr()
-    metrics: Dict[str, Any] = pydantic.PrivateAttr()
-
-    # Read only reference to external failure counters used to format error messages
-    #   populated with sane default and updated on calls to check_counters
-    counts_dict: Dict[int, int] = pydantic.PrivateAttr({})
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        for index, condition in enumerate(self.slo_input.conditions):
-            # Index is used as a psuedo ID to track failures across slo_check calls
-            result = SloResult(condition=condition, index=index)
-
-            # Aggregate metrics, prepare result for calculation
-            if not condition.get_values(self.metrics, result):
-                self.missing.append(result)
-                continue
-
-            # Perform checks
-            if condition.check_values(result.metric_scalar, result.threshold_product):
-                result.message = 'SLO passed'
-                self.passed.append(result)
-            else:
-                result.message = f'keep {condition.keep} not met'
-                self.failed.append(result)
-
-    @property
-    def failed_message(self) -> str:
-        return f"[from {self.from_} to {self.to}]" + ' | '.join(
-            map(lambda f: f.to_message(self.counts_dict), self.failed)
-        )
-
-    def check_counters(self, counts_dict: Dict[int, int]) -> bool:
-        """Updates an external dictionary of counters based on the current set of failures
-        """
-        self.counts_dict = counts_dict
-        failed_indexes = set(fr.index for fr in self.failed)
-
-        should_raise = False
-        for index, condition in enumerate(self.slo_input.conditions):
-            if index in failed_indexes:
-                counts_dict[index] += 1
-                if counts_dict[index] == condition.for_:
-                    should_raise = True
-            else:
-                counts_dict.pop(index, None)
-
-        return should_raise
-
-
-def aggregate_metric_values_to_scalar(
-    metric_name: str,
-    metrics: Dict[str, Any],
-    result: SloResult,
-    is_threshold: bool,
-) -> bool:
-    """Recieves information about a single slo condition as well as the fetched metrics and attempts to produce a scalar
-    value computed by producing a list of means from timeseries values returned per instance and producing a scalar from the mean
-    of per instance means
-
-    Args:
-        metric_name (str): Name of the metric to produce a scalar for
-        metrics (Dict[str, Any]): Fetched metrics as returned by get_metrics
-        result (SloResult): A reference to an SloResult object tracking the result of an individual condition, 
-            used to return the scalar value (metric_scalar/threshold_metric_scalar), information about the metrics payload, 
-            and a message if unable to compute a valid scalar
-        is_threshold (bool): Used to format result info based on whether marshalling a condition metric or threshold_metric
-
-    Returns:
-        bool: True if a scalar was produced, false to indicate the condition relying on the metric must be skipped
-    """
-    msg_preamble = 'Condition threshold' if is_threshold else 'Condition'
-    prop_preamble = "threshold_" if is_threshold else ""
-
-    if metric_name not in metrics:
-        result.message = f'{msg_preamble} metric not contained in fetched metrics'
-        return False
-
-    metric_values = metrics[metric_name]['values']
-    if not metric_values:
-        result.message = f'{msg_preamble} metric contained no instances or values'
-        return False
-
-    setattr(result, f'{prop_preamble}instances', ', '.join([val['id'] for val in metric_values]))
-    instance_values = [val['data'] for val in metric_values]
-
-    # Check at least one list has values
-    if not any(instance_values):
-        result.message = f'{msg_preamble} metric instance values all had empty data'
-        return False
-
-    inst_scalars = []
-    for val_list in instance_values:
-        if not val_list:
-            continue
-
-        # Pull metric values from timestamps, filter out falsey values; 0, 0.0
-        single_inst_vals = [decimal.Decimal(v[1]) for v in val_list if v[1]] # TODO: NaN check?
-        if not single_inst_vals:
-            continue
-
-        if len(single_inst_vals) == 1:
-            inst_scalars.append(single_inst_vals[0])
-        else:
-            # Compute mean for current instance
-            inst_scalars.append(statistics.mean(single_inst_vals))
-
-    if not inst_scalars:
-        result.message = f'{msg_preamble} metric instance values all had 0/falsey data'
-        return False
-
-    scalar = inst_scalars[0] if len(inst_scalars) == 1 else statistics.mean(inst_scalars)
-    setattr(result, f'{prop_preamble}metric_scalar', scalar)
-
-    return True
 
 
 class InsightsColumn:
@@ -486,10 +247,6 @@ class NewRelicDriver(Measure):
     time_to_wait = 0
     time_left = 0
 
-    slo_failed_counters: Dict[int, int] = defaultdict(int)
-    """Dictionary of SLO Condition index to failure counter mapping
-    """
-
     def stop_timer(self):
         if self.progress_timer:
             self.progress_timer.cancel()
@@ -505,10 +262,21 @@ class NewRelicDriver(Measure):
         self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
         self.start_timer()
 
-    def measure(self):
-        sleep_fn = time.sleep # overriden when slo provided
-        skip_sleep = os.environ.get('SKIP_SLEEP', False) # NOTE: this skips SLO checking as well as sleeps
+    slo_failed_status = 'aborted'
+    def slo_pass(self, checker: SloChecker):
+        # Log success results to driver STDOUT so they can be seen when servo is set to verbose
+        # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
+        print(checker.json(), flush=True)
+    
+    def slo_fail(self, checker: SloChecker):
+        # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
+        #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
+        #   in other connectors
+        self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
+        print(checker.error_json(self.slo_failed_status))
+        sys.exit(1)
 
+    def measure(self):
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
         duration = int(control.get('duration', DFLT_DURATION))
@@ -517,34 +285,32 @@ class NewRelicDriver(Measure):
         slo_check = control.get('userdata', {}).get('slo_check')
         slo = control.get('userdata', {}).get('slo')
 
+        skip_sleep = os.environ.get('SKIP_SLEEP', False) # NOTE: this skips SLO checking as well as sleeps
+        sleep_fn = time.sleep # overriden when slo provided
+
         if slo_check == 1 and slo is None:
             raise MeasureError("Invalid input: slo check mode enabled but no slo input was supplied", reason="invalid-input")
 
         if slo is not None:
-            slo_input = SloInput.parse_obj(slo)
+            slo_checker = SloChecker(
+                slo_input=slo, 
+                fast_fail_config=self.fast_fail_config,
+                metrics_getter=partial(self.get_metrics, update_progress=False),
+                on_pass=self.slo_pass,
+                on_fail=self.slo_fail,
+                timezone=timezone.utc,
+            )
 
-            if slo_check == 1:
-                results = self.check_slo(slo_input)        
-                if results.failed:
-                    # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
-                    #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
-                    #   in other connectors
-                    self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
-                    self.print_slo_error(message=results.failed_message, reason='slo-violation', results=results)
-                    sys.exit(1)
-
-                # Log success results to driver STDOUT so they can be seen when servo is set to verbose
-                # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
-                print('{"slo_results": ' + results.json() + ' }', flush=True)
+            if slo_check == 1: # One time run mode
+                self.slo_failed_status = 'failed'
+                slo_checker.check()        
                 
-                # NOTE: Base measure class always includes 'metrics' key with return value of this function,
-                #   override the functionality if we are in SLO check mode
                 self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
                 print('{"status": "ok"}', flush=True)
                 sys.exit(0)
+
             elif self.fast_fail_config.disabled != 1:
-                self.slo_skip_remaining = self.fast_fail_config.skip.total_seconds()
-                sleep_fn = partial(self.slo_check_sleep, slo_input=slo_input)
+                sleep_fn = slo_checker.check_sleep
 
         self.progress_message = 'Measurements started'
         self.print_progress()
@@ -721,75 +487,6 @@ class NewRelicDriver(Measure):
                                       stderr.replace('\n', '\n        ').strip() or 'empty string',
                                       repr(e)))
         return result
-
-    def check_slo(self, slo_input: SloInput) -> SloCheck:
-        measure_to = datetime.now(timezone.utc).replace(microsecond=0)
-        measure_from = (measure_to - self.fast_fail_config.span).replace(microsecond=0)
-        
-        metrics = self.get_metrics(measure_from, measure_to)
-        return SloCheck(
-            from_=measure_from, 
-            to=measure_to, 
-            slo_input=slo_input, 
-            metrics=metrics
-        )
-
-
-    def slo_check_sleep(self, secs: float, slo_input: SloInput) -> None:
-        """Pass through to time.sleep that divides the duration so that SLO checks are run
-        periodically based on the configuration of the fast_fail period
-        """
-        end_at = datetime.now() + timedelta(seconds=secs)
-        # Skip SLO checks for configured duration
-        if self.slo_skip_remaining:
-            if self.slo_skip_remaining > secs:
-                self.slo_skip_remaining -= secs
-                time.sleep(secs)
-                return
-            time.sleep(self.slo_skip_remaining)
-            self.slo_skip_remaining = 0
-
-        while (loop_start := datetime.now()) < end_at:
-            results: SloCheck = self.check_slo(slo_input)
-            if results.check_counts(self.slo_failed_counters):
-
-                # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
-                #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
-                #   in other connectors
-                self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
-                self.print_slo_error(results.failed_message, reason='slo-violation', status='aborted', results=results)
-                sys.exit(1)
-            else:
-                # Log success results to driver STDOUT so they can be seen when servo is set to verbose
-                # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
-                print('{"slo_results": ' + results.json(exclude_none=True) + ' }', flush=True)
-
-            # account for time taken by SLO check, clamp negative timedeltas to 0
-            remaining_period = max(0, (self.fast_fail_config.period - (datetime.now() - loop_start)).total_seconds())
-            remaining_total = max(0, (end_at - datetime.now()).total_seconds())
-            next_sleep = min(remaining_period, remaining_total)
-            time.sleep(next_sleep)
-
-
-    def print_slo_error(self, message, reason, status='failed', results=None):
-        '''
-        Prints JSON formatted error and exit
-        Takes an error message as string
-        '''
-        out = SloError(status=status, reason=reason, message=message)
-
-        # Note results won't make it to the backend but will show up in servo logs for additional triage
-        if results:
-            out.results = results
-
-        print(out.json(exclude_none=True), flush=True)
-
-# Define model for error to leverage pydantic json encoding on sub-properties
-class SloError(pydantic.BaseModel):
-    status: str
-    reason: str
-    message: str
-    results: Optional[SloResult] = None
 
 
 if __name__ == '__main__':
