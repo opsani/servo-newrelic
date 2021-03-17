@@ -300,15 +300,14 @@ class NewRelicDriver(Measure):
                 on_fail=self.slo_fail,
                 timezone=timezone.utc,
             )
-
             if slo_check == 1: # One time run mode
                 self.slo_failed_status = 'failed'
-                slo_checker.check()        
-                
+                slo_checker.check() # On fail handler exits if failed
+
+                # Success
                 self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
                 print('{"status": "ok"}', flush=True)
                 sys.exit(0)
-
             elif self.fast_fail_config.disabled != 1:
                 sleep_fn = slo_checker.check_sleep
 

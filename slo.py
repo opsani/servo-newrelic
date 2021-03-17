@@ -101,7 +101,7 @@ class BaseSloCondition(pydantic.BaseModel, abc.ABC):
         result.metric_scalar = inst_scalars[0] if len(inst_scalars) == 1 else statistics.mean(inst_scalars)
         return True
 
-def get_scalar_from_timeseries(timeseries: List[float, float]) -> Optional[decimal.Decimal]:
+def get_scalar_from_timeseries(timeseries: List[List[float]]) -> Optional[decimal.Decimal]:
     # Check for empty
     if not timeseries:
         return None
@@ -160,7 +160,8 @@ class ThresholdMetricCondition(BaseSloCondition):
             result.message = 'Condition threshold metric instance values all had 0/falsey data'
             return False
 
-        result.metric_scalar = inst_scalars[0] if len(inst_scalars) == 1 else statistics.mean(inst_scalars)
+        result.threshold_metric_scalar = inst_scalars[0] if len(inst_scalars) == 1 else statistics.mean(inst_scalars)
+        result.threshold_product = result.threshold_metric_scalar * self.threshold_multiplier
         return True
 
 class SloInput(pydantic.BaseModel):
@@ -176,12 +177,18 @@ class SloResult(pydantic.BaseModel):
     threshold_product: Optional[decimal.Decimal] = None
     instances: Optional[str] = None
     threshold_instances: Optional[str] = None
+    failed_count: int = 0 # Only updated on calls to check_counter
 
-    def to_message(self, counters: Dict[int, int] = {}):
-        x_num = counters.get(self.index, '')
-        if x_num != '':
-            x_num = f' x{x_num}'
+    def __str__(self):
+        x_num = ''
+        if self.failed_count:
+            x_num = f' x{self.failed_count}'
         return f"{self.condition} {self.message}{x_num}. computed values: metric {self.metric_scalar} threshold {self.threshold_product}"
+
+    def check_for(self, failed_count: int):
+        self.failed_count = failed_count
+        return failed_count >= self.condition.for_
+
 
 class SloResults(pydantic.BaseModel):
     """Represents the results of a single check run
@@ -194,35 +201,29 @@ class SloResults(pydantic.BaseModel):
         missing (List[SloResult]): List of SLO Check results which could not be computed for the provided metrics
         slo_input (SloInput): Configuration of SLO check conditions provided in the control section of driver input
         metrics (Dict[str, Any]): Queried metrics used to determine whether checks are passing
-        counters (Dict[int, int]): Copy of the state of external failure counters used to format error messages.
-            populated with sane default and updated on calls to check_counters
     """
 
-    from_: datetime = pydantic.Field(..., alias='from')
+    from_: datetime
     to: datetime
     passed: List[SloResult] = []
     failed: List[SloResult] = []
     missing: List[SloResult] = []
 
-    metrics: Dict[str, Any] = pydantic.PrivateAttr()
-    _counters: Dict[int, int] = pydantic.PrivateAttr({})
-
-    def to_message(self) -> str:
-        """Returns a string suitable for reporting the current set of failures. Includes count where applicable
+    @property
+    def failed_message(self) -> str:
+        """Returns a string suitable for reporting the current set of failures
         """
-        return f"[from {self.from_} to {self.to}]" + ' | '.join(
-            map(lambda f: f.to_message(self._counters), self.failed)
-        )
+        return f"[from {self.from_} to {self.to}]" + ' | '.join(map(str, self.failed))
 
-    def __init__(self, slo_input: SloInput, *args, **kwargs):
+    def __init__(self, slo_input: SloInput, metrics: Dict[str, Any], *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         for index, condition in enumerate(slo_input.conditions):
-            # Index is used as a psuedo ID to track failures across slo_check calls
+            # Index is used as a psuedo ID to track failures across check_sleep calls
             result = SloResult(condition=condition, index=index)
 
             # Aggregate metrics, prepare result for calculation
-            if not condition.get_values(self.metrics, result):
+            if not condition.get_values(metrics, result):
                 self.missing.append(result)
                 continue
 
@@ -234,22 +235,20 @@ class SloResults(pydantic.BaseModel):
                 result.message = f'keep {condition.keep} not met'
                 self.failed.append(result)
 
-    def check_counters(self, slo_input: SloInput, counts_dict: Dict[int, int]) -> bool:
+    def check_counters(self, counts_dict: Dict[int, int]) -> bool:
         """Updates an external dictionary of counters based on the current set of failures.
-        Stores updated counts 
+        Stores updated counts onto applicable failed results
         """
-        failed_indexes = set(fr.index for fr in self.failed)
+        new_counts, should_raise = {}, False
+        for fr in self.failed:
+            new_counts[fr.index] = counts_dict[fr.index] + 1
+            if fr.check_for(new_counts[fr.index]):
+                should_raise = True
 
-        should_raise = False
-        for index, condition in enumerate(slo_input.conditions):
-            if index in failed_indexes:
-                counts_dict[index] += 1
-                if counts_dict[index] == condition.for_:
-                    should_raise = True
-            else:
-                counts_dict.pop(index, None)
+        # Remove counters from previous failures that didn't fail this cycle
+        counts_dict.clear()
+        counts_dict.update(new_counts)
 
-        self._counters = copy(counts_dict)
         return should_raise
 
 
@@ -260,44 +259,55 @@ class SloChecker(pydantic.BaseModel):
 
     Attributes:
         timezone (timezone): Allows overriding of the time zone for the date parameters of the metrics query
+        _failed_counters (Dict[int, int]): Maps index of slo_input condition to the number of times it has failed during
+            sleep_check. Updated by reference inside SloResults.check_counters
     """
     fast_fail_config: FastFailConfig
     slo_input: SloInput
+    timezone_: Optional[timezone] = pydantic.Field(None, alias='timezone')
+
     metrics_getter: Callable[[datetime,datetime], Dict[str, Any]]
-    timezone: Optional[timezone] = None
     on_pass: Callable[["SloChecker"], None]
     on_fail: Callable[["SloChecker"], None]
 
-    slo_skip_remaining: float = pydantic.PrivateAttr()
-    counters: Dict[int, int] = pydantic.PrivateAttr(default_factory=lambda: defaultdict(int))
+    _skip_remaining: float = pydantic.PrivateAttr()
+    _failed_counters: Dict[int, int] = pydantic.PrivateAttr(default_factory=lambda: defaultdict(int))
+
     # TODO: track list of results for which there are active counters
-    last_results: Optional[SloResults] = pydantic.PrivateAttr(None)
+    last_results: Optional[SloResults] = None
+
+    def json(self):
+        return super().json(exclude={'slo_input', 'metrics_getter', 'on_pass', 'on_fail'})
+
+    class Config:
+        arbitrary_types_allowed = True
+
+        json_encoders = {
+            timezone: str,
+        }
 
     @property
     def failed_message(self):
         if not self.last_results:
             return 'failed results not set'
-        return self.last_results.to_message(self.counters)
+        return self.last_results.failed_message
 
     def __init__(self, slo_input, *args, **kwargs):
         if isinstance(slo_input, dict):
             slo_input = SloInput.parse_obj(slo_input)
-        super().__init__(slo_input, *args, **kwargs)
-        self.slo_skip_remaining = self.fast_fail_config.skip.total_seconds()
-
-    def json(self):
-        return self.json(exclude={'on_pass', 'on_fail', 'slo_input', 'fast_fail_config'})
+        super().__init__(*args, **kwargs, slo_input=slo_input)
+        self._skip_remaining = self.fast_fail_config.skip.total_seconds()
 
     def error_json(self, status='failed'):
         return SloError(
             message=self.failed_message, 
             reason='slo-violation', 
             status=status,
-            results=self.results
-        ).json(exclude_none=True)
+            checks=self
+        ).json()
 
-    def check(self, return_failure=False) -> SloResults:
-        measure_to = datetime.now(self.timezone).replace(microsecond=0)
+    def check(self, single_check=True) -> SloResults:
+        measure_to = datetime.now(self.timezone_).replace(microsecond=0)
         measure_from = (measure_to - self.fast_fail_config.span).replace(microsecond=0)
         
         metrics = self.metrics_getter(measure_from, measure_to)
@@ -308,28 +318,33 @@ class SloChecker(pydantic.BaseModel):
             metrics=metrics
         )
 
-        if not return_failure and results.failed:
-            self.on_fail()
+        if single_check:
+            self.last_results = results
+            self.last_results.check_counters(self._failed_counters)
+            if results.failed:
+                self.on_fail(self)
+            else:
+                self.on_pass(self)
         
         return results
 
-    def check_sleep(self, secs: float, slo_input: SloInput) -> None:
+    def check_sleep(self, secs: float) -> None:
         """Pass through to time.sleep that divides the duration so that SLO checks are run
         periodically based on the configuration of the fast_fail period
         """
         end_at = datetime.now() + timedelta(seconds=secs)
         # Skip SLO checks for configured duration
-        if self.slo_skip_remaining:
-            if self.slo_skip_remaining > secs:
-                self.slo_skip_remaining -= secs
+        if self._skip_remaining:
+            if self._skip_remaining > secs:
+                self._skip_remaining -= secs
                 time.sleep(secs)
                 return
-            time.sleep(self.slo_skip_remaining)
-            self.slo_skip_remaining = 0
+            time.sleep(self._skip_remaining)
+            self._skip_remaining = 0
 
         while (loop_start := datetime.now()) < end_at:
-            self.last_results: SloResults = self.check(return_failure=True)
-            if self.last_results.check_counters(self.slo_failed_counters):
+            self.last_results = self.check(single_check=False)
+            if self.last_results.check_counters(self._failed_counters):
                 self.on_fail(self)
             else:
                 self.on_pass(self)
@@ -345,4 +360,10 @@ class SloError(pydantic.BaseModel):
     status: str = 'failed'
     reason: str
     message: str
-    results: Optional[SloResult] = None
+    checks: Optional[SloChecker] = None
+
+    def json(self):
+        return super().json(exclude={'checks': {'slo_input', 'metrics_getter', 'on_pass', 'on_fail'}})
+
+    class Config:
+        json_encoders = { timezone: str }
