@@ -42,6 +42,10 @@ DFLT_WARMUP = 0
 DFLT_DURATION = 120
 DFLT_DELAY = 0
 
+# NOTE: this setting should only be used for debug/testing and
+#   will likely cause inoperable behavior if set during an optimization
+DEBUG_SKIP_SLEEP = os.environ.get('DEBUG_SKIP_SLEEP', False)
+
 # TODO: should env var credential support be kept after slo dev?
 NEWRELIC_ACCOUNT_ID = os.environ.get('NEWRELIC_ACCOUNT_ID') or str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
 NEWRELIC_APM_API_KEY = os.environ.get('NEWRELIC_APM_API_KEY') or str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
@@ -130,7 +134,7 @@ def aggregate_metric_values_to_scalar(
 
     metric_values = metrics[metric_name]['values']
     if not metric_values:
-        result['message'] = f'{preamble} metric contained no instances or values'
+        result['message'] = f'{preamble} metric values contained empty list of instances'
         return False
 
     result[f'{key_preamble}instances'] = ', '.join([val['id'] for val in metric_values])
@@ -146,8 +150,8 @@ def aggregate_metric_values_to_scalar(
         if not val_list:
             continue
 
-        # Pull metric values from timestamps, filter out falsey values; 0, 0.0
-        single_inst_vals = [decimal.Decimal(v[1]) for v in val_list if v[1]] # TODO: NaN check?
+        # Pull metric values from timestamps, filter out zero values to exclude timeslices for which no data was reported
+        single_inst_vals = [decimal.Decimal(v[1]) for v in val_list if v[1]]
         if not single_inst_vals:
             continue
 
@@ -381,7 +385,6 @@ class NewRelicDriver(Measure):
 
     def measure(self):
         sleep_fn = time.sleep # overriden when slo provided
-        skip_sleep = os.environ.get('SKIP_SLEEP', False) # NOTE: this skips SLO checking as well as sleeps
 
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
@@ -389,15 +392,18 @@ class NewRelicDriver(Measure):
         delay = int(control.get('delay', DFLT_DELAY))
 
         slo_check = control.get('userdata', {}).get('slo_check')
+        if slo_check not in [None, 0, 1]:
+            raise MeasureError(f"Invalid input: invalid value '{slo_check}' supplied for slo_check mode flag", reason="invalid-input")
+
         slo = control.get('userdata', {}).get('slo')
 
-        if slo_check == 1 and slo is None:
+        if slo_check and slo is None:
             raise MeasureError("Invalid input: slo check mode enabled but no slo input was supplied", reason="invalid-input")
 
         if slo is not None:
             slo_input = SloInput.parse_obj(slo)
 
-            if slo_check == 1:
+            if slo_check:
                 results = self.check_slo(slo_input)        
                 if (failed_results := results['failed']):
                     slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
@@ -423,7 +429,7 @@ class NewRelicDriver(Measure):
                 sys.exit(0)
             elif self.fast_fail_config.disabled != 1:
                 self.slo_skip_remaining = self.fast_fail_config.skip.total_seconds()
-                sleep_fn = partial(self.slo_check_sleep, slo_input=slo_input)
+                sleep_fn = partial(self.check_slo_sleep, slo_input=slo_input)
 
         self.progress_message = 'Measurements started'
         self.print_progress()
@@ -435,12 +441,12 @@ class NewRelicDriver(Measure):
         # Warmup nap
         if warmup > 0:
             self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
-            if not skip_sleep:
+            if not DEBUG_SKIP_SLEEP:
                 sleep_fn(warmup)
 
         # Wait before gathering measurements (historical data)
         self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
-        if not skip_sleep:
+        if not DEBUG_SKIP_SLEEP:
             sleep_fn(duration)
 
         measure_to = datetime.now(timezone.utc).replace(microsecond=0)
@@ -448,7 +454,7 @@ class NewRelicDriver(Measure):
 
         # Delay measurements
         self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
-        if not skip_sleep:
+        if not DEBUG_SKIP_SLEEP:
             sleep_fn(delay)
         self.stop_timer()
 
@@ -648,7 +654,7 @@ class NewRelicDriver(Measure):
         }
 
 
-    def slo_check_sleep(self, secs: float, slo_input: SloInput) -> None:
+    def check_slo_sleep(self, secs: float, slo_input: SloInput) -> None:
         """Pass through to time.sleep that divides the duration so that SLO checks are run
         periodically based on the configuration of the fast_fail period
         """
