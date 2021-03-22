@@ -78,7 +78,7 @@ class BaseSloCondition(pydantic.BaseModel, abc.ABC):
 
         metric_values = metrics[self.metric]['values']
         if not metric_values:
-            result.message = 'Condition metric contained no instances or values'
+            result.message = 'Condition metric values contained empty list of instances'
             return False
 
         result.instances = ', '.join([val['id'] for val in metric_values])
@@ -106,8 +106,8 @@ def get_scalar_from_timeseries(timeseries: List[List[float]]) -> Optional[decima
     if not timeseries:
         return None
 
-    # Pull metric values from timestamps, filter out falsey values; 0, 0.0
-    ts_vals = [decimal.Decimal(v[1]) for v in timeseries if v[1]] # TODO: NaN check?
+    # Pull metric values from timestamps, filter out zero values to exclude timeslices for which no data was reported
+    ts_vals = [decimal.Decimal(v[1]) for v in timeseries if v[1]]
     if not ts_vals:
         return None
 
@@ -140,7 +140,7 @@ class ThresholdMetricCondition(BaseSloCondition):
 
         metric_values = metrics[self.threshold_metric]['values']
         if not metric_values:
-            result.message = 'Condition threshold metric contained no instances or values'
+            result.message = 'Condition threshold metric values contained empty list of instances'
             return False
 
         result.threshold_instances = ', '.join([val['id'] for val in metric_values])
