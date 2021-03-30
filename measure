@@ -404,11 +404,11 @@ class NewRelicDriver(Measure):
             slo_input = SloInput.parse_obj(slo)
 
             if slo_check:
-                results = self.check_slo(slo_input)        
-                if (failed_results := results['failed']):
+                results = self.check_slo(slo_input)
+                if results['failed']:
                     slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
                         f"{fr['condition_repr']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
-                        for fr in failed_results
+                        for fr in results['failed']
                     ])
 
                     # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
@@ -668,7 +668,8 @@ class NewRelicDriver(Measure):
             time.sleep(self.slo_skip_remaining)
             self.slo_skip_remaining = 0
 
-        while (loop_start := datetime.now()) < end_at:
+        while datetime.now() < end_at:
+            loop_start = datetime.now()
             results = self.check_slo(slo_input)
             failed_indexes = set(fr['index'] for fr in results['failed'])
 
