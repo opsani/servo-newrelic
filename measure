@@ -502,6 +502,7 @@ class NewRelicDriver(Measure):
                 query = fetch['query'].format(from_time=measure_from.isoformat(),
                                               to_time=measure_to.isoformat())
                 response = insights_session.get('', params=dict(nrql=query))
+                response.raise_for_status()
                 data = response.json()
                 if 'error' in data:
                     raise InsightsException('{}\nIn Query:\n{}'.format(data['error'], query))
@@ -515,6 +516,7 @@ class NewRelicDriver(Measure):
                 for hostname in hostnames:
                     response = apm_session.get(APM_INSTANCE_LIST_URL.format(app_id=NEWRELIC_APM_APP_ID),
                                                params={'filter[hostname]': hostname})
+                    response.raise_for_status()
                     hosts.add_response_data(response.json())
                 fetches[fetch_name] = hosts
 
@@ -541,6 +543,7 @@ class NewRelicDriver(Measure):
                         'summarize': False,
                         'raw': True,
                     })
+                    response.raise_for_status()
                     a.add_response_data({'instance_id': instance_id, **response.json()})
 
         for config_metric in config_metrics:
