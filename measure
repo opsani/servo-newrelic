@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
+import abc
+import decimal
 import json
 import os
 import subprocess
 import sys
 from dateutil import parser as date_parser
 import math
+import operator
+import statistics
 
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from threading import Timer
 
+import pydantic
 import requests
 import yaml
 from requests.adapters import HTTPAdapter
+from typing import Any, Dict, List, Optional, Union
 from urllib3 import Retry
 
 from measure import Measure, ST_FAILED
+
+class MeasureError(Exception):
+    """base class for error exceptions defined by drivers.
+    """
+
+    def __init__(self, *args, status="failed", reason="unknown"):
+        self.status = status
+        self.reason = reason
+        super().__init__(*args)
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
@@ -26,10 +42,15 @@ DFLT_WARMUP = 0
 DFLT_DURATION = 120
 DFLT_DELAY = 0
 
-NEWRELIC_ACCOUNT_ID = str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
-NEWRELIC_APM_API_KEY = str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
-NEWRELIC_APM_APP_ID = str(open('/run/secrets/optune_newrelic_apm_app_id').read()).strip()
-NEWRELIC_INSIGHTS_QUERY_KEY = str(open('/run/secrets/optune_newrelic_insights_query_key').read()).strip()
+# NOTE: this setting should only be used for debug/testing and
+#   will likely cause inoperable behavior if set during an optimization
+DEBUG_SKIP_SLEEP = os.environ.get('DEBUG_SKIP_SLEEP', False)
+
+# TODO: should env var credential support be kept after slo dev?
+NEWRELIC_ACCOUNT_ID = os.environ.get('NEWRELIC_ACCOUNT_ID') or str(open('/run/secrets/optune_newrelic_account_id').read()).strip()
+NEWRELIC_APM_API_KEY = os.environ.get('NEWRELIC_APM_API_KEY') or str(open('/run/secrets/optune_newrelic_apm_api_key').read()).strip()
+NEWRELIC_APM_APP_ID = os.environ.get('NEWRELIC_APM_APP_ID') or str(open('/run/secrets/optune_newrelic_apm_app_id').read()).strip()
+NEWRELIC_INSIGHTS_QUERY_KEY = os.environ.get('NEWRELIC_INSIGHTS_QUERY_KEY') or str(open('/run/secrets/optune_newrelic_insights_query_key').read()).strip()
 APM_API_URL = 'https://api.newrelic.com/v2'
 APM_INSTANCE_LIST_URL = '/applications/{app_id}/instances.json'
 APM_INSTANCE_METRICS_URL = '/applications/{app_id}/instances/{instance_id}/metrics/data.json'
@@ -50,10 +71,6 @@ _safe_builtins["__builtins__"] = {}
 
 def safe_eval(inline_code, local_variables):
     return eval(inline_code, _safe_builtins, local_variables)
-
-
-with open('./config.yaml') as f:
-    config = yaml.load(f.read())['newrelic']
 
 
 def url_session(prefix=None):
@@ -85,6 +102,113 @@ apm_session.headers.update({'X-Api-Key': NEWRELIC_APM_API_KEY})
 
 insights_session = url_session(INSIGHTS_API_URL.format(account_id=NEWRELIC_ACCOUNT_ID))
 insights_session.headers.update({'X-Query-Key': NEWRELIC_INSIGHTS_QUERY_KEY})
+
+
+def aggregate_metric_values_to_scalar(
+    metric_name: str,
+    metrics: Dict[str, Any],
+    result: Dict[str, Any],
+    is_threshold: bool,
+) -> bool:
+    """Recieves information about a single slo condition as well as the fetched metrics and attempts to produce a scalar
+    value computed by producing a list of means from timeseries values returned per instance and producing a scalar from the mean
+    of per instance means
+
+    Args:
+        metric_name (str): Name of the metric to produce a scalar for
+        metrics (Dict[str, Any]): Fetched metrics as returned by get_metrics
+        result (Dict[str, Any]): A reference to a dictionary tracking the result of an individual condition, 
+            used to return the scalar value (keyed metric_scalar/threshold_metric_scalar), information about the metrics payload, 
+            and a message if unable to compute a valid scalar
+        is_threshold (bool): Used to format result info based on whether marshalling a condition metric or threshold_metric
+
+    Returns:
+        bool: True if a scalar was produced, false to indicate the condition relying on the metric must be skipped
+    """
+    preamble = 'Condition threshold' if is_threshold else 'Condition'
+    key_preamble = "threshold_" if is_threshold else ""
+
+    if metric_name not in metrics:
+        result['message'] = f'{preamble} metric not contained in fetched metrics'
+        return False
+
+    metric_values = metrics[metric_name]['values']
+    if not metric_values:
+        result['message'] = f'{preamble} metric values contained empty list of instances'
+        return False
+
+    result[f'{key_preamble}instances'] = ', '.join([val['id'] for val in metric_values])
+    instance_values = [val['data'] for val in metric_values]
+    
+    # Check at least one list has values
+    if not any(instance_values):
+        result['message'] = f'{preamble} metric instance values all had empty data'
+        return False
+
+    inst_scalars = []
+    for val_list in instance_values:
+        if not val_list:
+            continue
+
+        # Pull metric values from timestamps, filter out zero values to exclude timeslices for which no data was reported
+        single_inst_vals = [decimal.Decimal(v[1]) for v in val_list if v[1]]
+        if not single_inst_vals:
+            continue
+
+        if len(single_inst_vals) == 1:
+            inst_scalars.append(single_inst_vals[0])
+        else:
+            # Compute mean for current instance
+            inst_scalars.append(statistics.mean(single_inst_vals))
+
+    if not inst_scalars:
+        result['message'] = f'{preamble} metric instance values all had 0/falsey data'
+        return False
+
+    if len(inst_scalars) == 1:
+        result[f'{key_preamble}metric_scalar'] = inst_scalars[0]
+    else:
+        # Compute means across instances and store on result ref
+        result[f'{key_preamble}metric_scalar'] = statistics.mean(inst_scalars)
+
+    return True
+
+class FastFailConfig(pydantic.BaseModel):
+    disabled: pydantic.conint(ge=0, le=1, multiple_of=1) = 0
+    period: timedelta = timedelta(seconds=60)
+    span: timedelta = None
+    skip: timedelta = timedelta(seconds=0)
+
+    @pydantic.validator('span', pre=True, always=True)
+    def span_defaults_to_period(cls, v, *, values, **kwargs):
+        if v is None:
+            return values['period']
+        return v
+
+
+class BaseSloCondition(pydantic.BaseModel, abc.ABC):
+    description: Optional[str] = None
+    metric: str
+    threshold_multiplier: decimal.Decimal = decimal.Decimal(1)
+    keep: pydantic.constr(strip_whitespace=True, regex='above|below') = 'below'
+    for_: int = pydantic.Field(default=1, alias='for', ge=1)
+    
+    class Config:
+        extra = 'forbid'
+
+    def __str__(self) -> str:
+        if self.description is None:
+            return f"({self.metric})"
+        return f"({self.metric} -> {self.description})"
+
+class ThresholdConstantCondition(BaseSloCondition):
+    threshold: decimal.Decimal
+
+class ThresholdMetricCondition(BaseSloCondition):
+    threshold_metric: str
+
+class SloInput(pydantic.BaseModel):
+    conditions: List[Union[ThresholdConstantCondition, ThresholdMetricCondition]]
 
 
 class InsightsColumn:
@@ -214,22 +338,35 @@ class APMMetric:
             r = {'id': str(_id), 'data': []}
             data = r['data']
             m = None
-            for metric in instance['metric_data']['metrics']:
+            for metric in instance.get('metric_data', {}).get('metrics', []):
                 if metric['name'] == self.metric_name:
                     m = metric
                     break
-            for ts in m['timeslices']:
-                value = ts['values'][item]
-                timestamp = int(date_parser.parse(ts['from']).timestamp())
-                data.append([timestamp, value])
+            if m is not None:
+                for ts in m['timeslices']:
+                    value = ts['values'][item]
+                    timestamp = int(date_parser.parse(ts['from']).timestamp())
+                    data.append([timestamp, value])
             ret.append(r)
         return ret
 
 
 class NewRelicDriver(Measure):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        with open('./config.yaml') as f:
+            self.config = yaml.load(f.read(), Loader=yaml.SafeLoader)['newrelic']
+
+        self.fast_fail_config: FastFailConfig = FastFailConfig.parse_obj(self.config.get('fast_fail', {}))
+
     progress_timer = None
     time_to_wait = 0
     time_left = 0
+
+    slo_failed_counters: Dict[int, int] = defaultdict(int)
+    """Dictionary of SLO Condition index to failure counter mapping
+    """
 
     def stop_timer(self):
         if self.progress_timer:
@@ -247,14 +384,55 @@ class NewRelicDriver(Measure):
         self.start_timer()
 
     def measure(self):
-        skip_sleep = os.environ.get('SKIP_SLEEP', False)
-        self.progress_message = 'Measurements started'
-        self.print_progress()
+        sleep_fn = time.sleep # overriden when slo provided
 
         control = self.input_data.get('control', {})
         warmup = int(control.get('warmup', DFLT_WARMUP))
         duration = int(control.get('duration', DFLT_DURATION))
         delay = int(control.get('delay', DFLT_DELAY))
+
+        slo_check = control.get('userdata', {}).get('slo_check')
+        if slo_check not in [None, 0, 1]:
+            raise MeasureError(f"Invalid input: invalid value '{slo_check}' supplied for slo_check mode flag", reason="invalid-input")
+
+        slo = control.get('userdata', {}).get('slo')
+
+        if slo_check and slo is None:
+            raise MeasureError("Invalid input: slo check mode enabled but no slo input was supplied", reason="invalid-input")
+
+        if slo is not None:
+            slo_input = SloInput.parse_obj(slo)
+
+            if slo_check:
+                results = self.check_slo(slo_input)
+                if results['failed']:
+                    slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
+                        f"{fr['condition_repr']} {fr['message']}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
+                        for fr in results['failed']
+                    ])
+
+                    # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
+                    #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
+                    #   in other connectors
+                    self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
+                    self.print_slo_error(message=slo_message, reason='slo-violation', results=results)
+                    sys.exit(1)
+
+                # Log success results to driver STDOUT so they can be seen when servo is set to verbose
+                # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
+                print(json.dumps({'slo_results': results }, default=str), flush=True)
+                
+                # NOTE: Base measure class always includes 'metrics' key with return value of this function,
+                #   override the functionality if we are in SLO check mode
+                self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
+                print('{"status": "ok"}', flush=True)
+                sys.exit(0)
+            elif self.fast_fail_config.disabled != 1:
+                self.slo_skip_remaining = self.fast_fail_config.skip.total_seconds()
+                sleep_fn = partial(self.check_slo_sleep, slo_input=slo_input)
+
+        self.progress_message = 'Measurements started'
+        self.print_progress()
 
         self.time_to_wait = warmup + duration + delay
         self.time_left = self.time_to_wait
@@ -262,33 +440,48 @@ class NewRelicDriver(Measure):
 
         # Warmup nap
         if warmup > 0:
-            self.progress = 0
             self.progress_message = 'WARMUP: sleeping {} seconds'.format(warmup)
-            if not skip_sleep:
-                time.sleep(warmup)
+            if not DEBUG_SKIP_SLEEP:
+                sleep_fn(warmup)
 
         # Wait before gathering measurements (historical data)
         self.progress_message = 'DURATION: waiting {} seconds for measurements'.format(duration)
-        if not skip_sleep:
-            time.sleep(duration)
+        if not DEBUG_SKIP_SLEEP:
+            sleep_fn(duration)
 
-        metrics = {}
         measure_to = datetime.now(timezone.utc).replace(microsecond=0)
         measure_from = measure_to - timedelta(seconds=duration)
 
         # Delay measurements
         self.progress_message = 'DELAY: sleeping {} seconds'.format(delay)
-        if not skip_sleep:
-            time.sleep(delay)
+        if not DEBUG_SKIP_SLEEP:
+            sleep_fn(delay)
         self.stop_timer()
 
-        config_fetches = config['fetch']
+        metrics = self.get_metrics(measure_from, measure_to, update_progress=True)
+
+        self.progress = 100
+        self.progress_message = 'Measurements completed'
+        self.print_progress()
+
+        return metrics, {}
+
+    def get_metrics(
+        self, 
+        measure_from: datetime, 
+        measure_to: datetime,
+        update_progress=False,
+    ):
+    
+        metrics = {}
+
+        config_fetches = self.config['fetch']
         config_fetches_len = len(config_fetches)
-        config_metrics = config['metrics']
+        config_metrics = self.config['metrics']
 
         # Acquire instance ids through respective config command if present
         instance_ids = {}
-        instance_ids_cmd = config.get('instance_ids_cmd')
+        instance_ids_cmd = self.config.get('instance_ids_cmd')
         if instance_ids_cmd:
             result = self.run_instance_ids_cmd(instance_ids_cmd)
             if 'instance_ids' in result:
@@ -300,14 +493,16 @@ class NewRelicDriver(Measure):
         for i, fetch in enumerate(config_fetches):
             fetch_name = fetch['name']
             fetch_api = fetch['api']
-            self.progress = 80 + ((i / config_fetches_len) * 20)
-            self.progress_message = 'Fetching data for {}'.format(fetch_name)
+            if update_progress:
+                self.progress = 80 + ((i / config_fetches_len) * 20)
+                self.progress_message = 'Fetching data for {}'.format(fetch_name)
 
             # Handle Insights API call.
             if fetch_api == 'insights':
                 query = fetch['query'].format(from_time=measure_from.isoformat(),
                                               to_time=measure_to.isoformat())
                 response = insights_session.get('', params=dict(nrql=query))
+                response.raise_for_status()
                 data = response.json()
                 if 'error' in data:
                     raise InsightsException('{}\nIn Query:\n{}'.format(data['error'], query))
@@ -321,6 +516,7 @@ class NewRelicDriver(Measure):
                 for hostname in hostnames:
                     response = apm_session.get(APM_INSTANCE_LIST_URL.format(app_id=NEWRELIC_APM_APP_ID),
                                                params={'filter[hostname]': hostname})
+                    response.raise_for_status()
                     hosts.add_response_data(response.json())
                 fetches[fetch_name] = hosts
 
@@ -347,6 +543,7 @@ class NewRelicDriver(Measure):
                         'summarize': False,
                         'raw': True,
                     })
+                    response.raise_for_status()
                     a.add_response_data({'instance_id': instance_id, **response.json()})
 
         for config_metric in config_metrics:
@@ -358,15 +555,11 @@ class NewRelicDriver(Measure):
                 compiled_metric['value'] = safe_eval(config_metric['value'], fetches)
             metrics[config_metric['name']] = compiled_metric
 
-        self.progress = 100
-        self.progress_message = 'Measurements completed'
-        self.print_progress()
-
-        return metrics, {}
+        return metrics
 
     def describe(self):
         metrics = {}
-        for metric in config['metrics']:
+        for metric in self.config['metrics']:
             keys = {}
             for mk, mv in metric.items():
                 if mk not in ['name', 'value', 'values']:
@@ -377,6 +570,7 @@ class NewRelicDriver(Measure):
     def handle_cancel(self, signal, frame):
         err = 'Exiting due to signal: {}'.format(signal)
         self.debug(err)
+        self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
         self.print_measure_error(err, ST_FAILED)
 
         sys.exit(0)
@@ -415,6 +609,122 @@ class NewRelicDriver(Measure):
                                       stderr.replace('\n', '\n        ').strip() or 'empty string',
                                       repr(e)))
         return result
+
+    def check_slo(self, slo_input: SloInput) -> Dict[str, List[Dict[str, Any]]]:
+        measure_to = datetime.now(timezone.utc).replace(microsecond=0)
+        measure_from = (measure_to - self.fast_fail_config.span).replace(microsecond=0)
+        
+        metrics = self.get_metrics(measure_from, measure_to)
+
+        nan_results = []
+        failed_results = []
+        passed_results = []
+        for index, condition in enumerate(slo_input.conditions):
+            # Index is used as a psuedo ID to track failures across slo_check calls
+            result = { 'condition': condition.dict(), 'condition_repr': str(condition), 'index': index }
+
+            # try to produce a scalar value from one or more metric data points, store into result['metric_scalar']
+            if not aggregate_metric_values_to_scalar(condition.metric, metrics, result, is_threshold=False):
+                nan_results.append(result)
+                continue
+
+            if isinstance(condition, ThresholdConstantCondition):
+                result['threshold_product'] = condition.threshold * condition.threshold_multiplier
+            elif isinstance(condition, ThresholdMetricCondition):
+                # try to produce a scalar, store into result['threshold_metric_scalar']
+                if not aggregate_metric_values_to_scalar(condition.threshold_metric, metrics, result, is_threshold=True):
+                    nan_results.append(result)
+                    continue
+
+                result['threshold_product'] = result['threshold_metric_scalar'] * condition.threshold_multiplier
+            else:
+                raise MeasureError(f'Unable to process slo condition with type {type(condition).__name__}', reason='invalid-type')
+
+            check_op = operator.lt if condition.keep == 'below' else operator.gt
+            if check_op(result['metric_scalar'], result['threshold_product']):
+                result['message'] = 'SLO passed'
+                passed_results.append(result)
+            else:
+                result['message'] = f'keep {condition.keep} not met'
+                failed_results.append(result)
+
+        return {
+            'from': str(measure_from),
+            'to': str(measure_to),
+            'missing_or_nan': nan_results, 
+            'failed': failed_results, 
+            'passed': passed_results
+        }
+
+
+    def check_slo_sleep(self, secs: float, slo_input: SloInput) -> None:
+        """Pass through to time.sleep that divides the duration so that SLO checks are run
+        periodically based on the configuration of the fast_fail period
+        """
+        end_at = datetime.now() + timedelta(seconds=secs)
+        # Skip SLO checks for configured duration
+        if self.slo_skip_remaining:
+            if self.slo_skip_remaining > secs:
+                self.slo_skip_remaining -= secs
+                time.sleep(secs)
+                return
+            time.sleep(self.slo_skip_remaining)
+            self.slo_skip_remaining = 0
+
+        while datetime.now() < end_at:
+            loop_start = datetime.now()
+            results = self.check_slo(slo_input)
+            failed_indexes = set(fr['index'] for fr in results['failed'])
+
+            raise_for = False
+            for index, condition in enumerate(slo_input.conditions):
+                if index in failed_indexes:
+                    self.slo_failed_counters[index] += 1
+                    if self.slo_failed_counters[index] == condition.for_:
+                        raise_for = True
+                else:
+                    self.slo_failed_counters.pop(index, None)
+
+            if raise_for:
+                slo_message = f"[from {results['from']} to {results['to']}]" + ' | '.join([
+                    f"{fr['condition_repr']} {fr['message']} x{self.slo_failed_counters[fr['index']]}. computed values: metric {fr['metric_scalar']} threshold {fr['threshold_product']}"
+                    for fr in results['failed']
+                ])
+
+                # NOTE: base measure.py exception handling hard codes status="500" with no reason included.
+                #   The exception functionality of the base is overriden here instead to reduce risk of side-effects
+                #   in other connectors
+                self.stop_progress_timer() # Ensure progress timer thread doesn't make a last minute print before exit
+                self.print_slo_error(slo_message, reason='slo-violation', status='aborted', results=results)
+                sys.exit(1)
+            else:
+                # Log success results to driver STDOUT so they can be seen when servo is set to verbose
+                # TODO: do we want to send any of this in progress updates, the measure response, and/or slo check mode response?
+                print(json.dumps({'slo_results': results }, default=str), flush=True)
+
+            # account for time taken by SLO check, clamp negative timedeltas to 0
+            remaining_period = max(0, (self.fast_fail_config.period - (datetime.now() - loop_start)).total_seconds())
+            remaining_total = max(0, (end_at - datetime.now()).total_seconds())
+            next_sleep = min(remaining_period, remaining_total)
+            time.sleep(next_sleep)
+
+
+    def print_slo_error(self, message, reason, status='failed', results=None):
+        '''
+        Prints JSON formatted error and exit
+        Takes an error message as string
+        '''
+        out = {
+            "status": status,
+            "reason": reason,
+            "message": message
+        }
+
+        # Note results won't make it to the backend but will show up in servo logs for additional triage
+        if results:
+            out["results"] = results
+
+        print(json.dumps(out, default=str), flush=True)
 
 
 if __name__ == '__main__':
