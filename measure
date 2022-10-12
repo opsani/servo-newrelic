@@ -88,7 +88,7 @@ def url_session(prefix=None):
     # Retries mechanism configuration
     retries = Retry(total=10, connect=5,
                     status=5,
-                    method_whitelist=('GET',),
+                    allowed_methods=({'GET'}),
                     status_forcelist=(307, 408, 409, 429, 500, 502, 503, 504),
                     backoff_factor=.2)
     s.mount('http://', HTTPAdapter(max_retries=retries))
