@@ -36,7 +36,7 @@ class MeasureError(Exception):
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
-VERSION = '0.1.1'
+VERSION = '1.3'
 
 DFLT_WARMUP = 0
 DFLT_DURATION = 120
