@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+
 from dateutil import parser as date_parser
 import math
 import operator
@@ -36,7 +37,7 @@ class MeasureError(Exception):
 
 DESC = 'NewRelic measure driver for Optune'
 HAS_CANCEL = True
-VERSION = '1.3'
+VERSION = '1.3.3'
 
 DFLT_WARMUP = 0
 DFLT_DURATION = 120
@@ -383,6 +384,13 @@ class NewRelicDriver(Measure):
         self.progress = int((1 - self.time_left / self.time_to_wait) * 80)
         self.start_timer()
 
+    # Disable the progress timer by overloading the superclass
+    # The progress timer and Vegeta get caught in a race that can
+    # result in multiple progress updates getting written onto the
+    # same line of stdout, resulting in invalid JSON
+    def start_progress_timer(self):
+        pass
+    
     def measure(self):
         sleep_fn = time.sleep # overriden when slo provided
 
@@ -529,11 +537,11 @@ class NewRelicDriver(Measure):
                         yield from m['values']
 
                 fetches[fetch_name] = a = APMMetrics()
-                instance_ids = safe_eval(fetch['instance_ids'], local_variables=fetches)
-                for instance_id in instance_ids:
+                apm_instance_ids = safe_eval(fetch['instance_ids'], local_variables=fetches)
+                for apm_instance_id in apm_instance_ids:
                     response = apm_session.get(APM_INSTANCE_METRICS_URL.format(
                         app_id=NEWRELIC_APM_APP_ID,
-                        instance_id=instance_id,
+                        instance_id=apm_instance_id,
                     ), params={
                         'names[]': list(map(lambda m: m['name'], fetch_metrics)),
                         'values[]': list(get_metric_values(fetch_metrics)),
@@ -554,7 +562,6 @@ class NewRelicDriver(Measure):
             elif 'value' in config_metric:
                 compiled_metric['value'] = safe_eval(config_metric['value'], fetches)
             metrics[config_metric['name']] = compiled_metric
-
         return metrics
 
     def describe(self):
