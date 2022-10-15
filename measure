@@ -537,11 +537,11 @@ class NewRelicDriver(Measure):
                         yield from m['values']
 
                 fetches[fetch_name] = a = APMMetrics()
-                apm_instance_ids = safe_eval(fetch['instance_ids'], local_variables=fetches)
-                for apm_instance_id in apm_instance_ids:
+                instance_ids = safe_eval(fetch['instance_ids'], local_variables=fetches)
+                for instance_id in instance_ids:
                     response = apm_session.get(APM_INSTANCE_METRICS_URL.format(
                         app_id=NEWRELIC_APM_APP_ID,
-                        instance_id=apm_instance_id,
+                        instance_id=instance_id,
                     ), params={
                         'names[]': list(map(lambda m: m['name'], fetch_metrics)),
                         'values[]': list(get_metric_values(fetch_metrics)),
